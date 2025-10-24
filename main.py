@@ -70,29 +70,46 @@ CURRENT_REMINDERS = []
 # Maps user_id -> IANA timezone string (e.g., "America/New_York")
 USER_TIMEZONES = {}
 
+# In-memory per-user reminder delivery channel/thread (lost on restart)
+# Maps user_id -> channel_or_thread_id (int)
+USER_REMINDER_CHANNELS = {}
+
 
 async def get_reminders_channel(ctx):
     """
-    Resolve the target channel to post reminders.
+    Resolve the target channel/thread to post reminders for the invoking user.
     Priority:
-    1) A text channel named "🗓️reminders" in the same guild.
-    2) Fallback to a channel named "reminders" if the emoji name doesn't exist.
-    3) Fallback to the invoking channel if nothing suitable is found or in DMs.
+    1) User-configured channel/thread set via !setremindchannel.
+    2) Fallback to the invoking channel (works for text channels, threads, and DMs).
     """
     try:
-        # If invoked in a guild, try to find the designated reminders channel.
-        if ctx.guild is not None:
-            me = ctx.guild.me or ctx.me
-            for name in REMINDERS_CHANNEL_NAMES:
-                ch = discord.utils.get(ctx.guild.text_channels, name=name)
-                if ch and ch.permissions_for(me).send_messages:
+        user_id = getattr(getattr(ctx, 'author', None), 'id', None)
+        # Use user-configured target if available
+        if user_id and user_id in USER_REMINDER_CHANNELS:
+            target_id = USER_REMINDER_CHANNELS.get(user_id)
+            ch = bot.get_channel(target_id)
+            if ch is None:
+                try:
+                    ch = await bot.fetch_channel(target_id)
+                except Exception:
+                    ch = None
+            if ch is not None:
+                # Check send permissions where applicable (guild channels/threads)
+                can_send = True
+                try:
+                    guild = getattr(ch, 'guild', None)
+                    if guild is not None:
+                        me = guild.me or ctx.me
+                        perms = ch.permissions_for(me)
+                        can_send = bool(getattr(perms, 'send_messages', False))
+                except Exception:
+                    pass
+                if can_send:
                     return ch
-            logging.warning("Reminders channel not found or no permission in guild '%s'. Falling back to invoking channel.", getattr(ctx.guild, 'name', 'unknown'))
-            return ctx.channel
-        # In DMs, there is no guild — send back to the DM channel.
+        # Fallback to invoking channel
         return ctx.channel
     except Exception as e:
-        logging.exception("Failed to resolve reminders channel: %s", e)
+        logging.exception("Failed to resolve delivery channel: %s", e)
         return ctx.channel
 
 
@@ -156,6 +173,9 @@ async def remindme(ctx, when: str = None, *, message: str = None):
             try:
                 delay = max(0, (due - datetime.now()).total_seconds())
                 await asyncio.sleep(delay)
+                # Skip if cancelled or removed
+                if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+                    return
                 target_channel = await get_reminders_channel(ctx)
                 await target_channel.send(f"{message}\n{ctx.author.mention}")
             except Exception as e:
@@ -191,6 +211,9 @@ async def remindme(ctx, when: str = None, *, message: str = None):
     async def deliver():
         try:
             await asyncio.sleep(seconds)
+            # Skip if cancelled or removed
+            if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+                return
             # If the channel still exists and the bot can send messages, deliver it to the reminders channel.
             target_channel = await get_reminders_channel(ctx)
             await target_channel.send(f"{message}\n{ctx.author.mention}")
@@ -321,6 +344,9 @@ async def remindevery(ctx, weekday: str = None, *, message: str = None):
             initial_delay = max(0, (next_run - datetime.now()).total_seconds())
             await asyncio.sleep(initial_delay)
             while True:
+                # Stop if cancelled/removed
+                if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+                    break
                 try:
                     await target_channel.send(f"{actual_message}\n{ctx.author.mention}")
                 except Exception as e:
@@ -335,7 +361,14 @@ async def remindevery(ctx, weekday: str = None, *, message: str = None):
                         next_sleep = 7 * 24 * 3600
                 except Exception:
                     next_sleep = 7 * 24 * 3600
+                # Sleep, but wake if cancelled by re-check after sleep
                 await asyncio.sleep(next_sleep)
+            # Cleanup: ensure removed from registry
+            try:
+                if entry in CURRENT_REMINDERS:
+                    CURRENT_REMINDERS.remove(entry)
+            except Exception:
+                pass
         except Exception as e:
             logging.exception("Recurring reminder loop ended: %s", e)
 
@@ -436,6 +469,85 @@ async def settimezone(ctx, tz: str = None):
     await ctx.send(f"{ctx.author.mention} Your time zone has been set to {tz}.")
 
 
+@bot.command(name="setremindchannel", aliases=["setchannel"], help="Set the channel or thread where your reminders will be sent: !setremindchannel [here|#channel|channel_id|thread_id]")
+async def setchannel(ctx, *, target: str = None):
+    """
+    Set your reminders delivery channel/thread.
+    Usage: !setremindchannel [here|#channel|channel_id|thread_id]
+    If omitted, defaults to the current channel/thread.
+    """
+    try:
+        ch_obj = None
+        if target is None or target.strip().lower() in ("here", "this"):
+            ch_obj = ctx.channel
+        else:
+            t = target.strip()
+            id_str = None
+            m = re.fullmatch(r"<#(\d+)>", t)
+            if m:
+                id_str = m.group(1)
+            elif re.fullmatch(r"\d{5,}", t):
+                id_str = t
+            else:
+                # Try resolve by name within the guild
+                if ctx.guild is not None:
+                    name = t.lstrip('#').lower()
+                    ch_obj = discord.utils.get(ctx.guild.text_channels, name=name)
+                    # Try active threads in the current channel
+                    if ch_obj is None:
+                        try:
+                            threads = []
+                            if hasattr(ctx.channel, 'threads'):
+                                threads = list(ctx.channel.threads)
+                            # Also include archived threads if available via API (skip HTTP for simplicity)
+                            for th in threads:
+                                if getattr(th, 'name', '').lower() == name:
+                                    ch_obj = th
+                                    break
+                        except Exception:
+                            pass
+            if ch_obj is None and id_str:
+                try:
+                    cid = int(id_str)
+                except ValueError:
+                    cid = None
+                if cid is not None:
+                    ch_obj = bot.get_channel(cid)
+                    if ch_obj is None:
+                        try:
+                            ch_obj = await bot.fetch_channel(cid)
+                        except Exception:
+                            ch_obj = None
+        if ch_obj is None:
+            return await ctx.send("I couldn't find that channel/thread. Provide a channel mention like #general, a numeric ID, or use !setremindchannel here.")
+        # Validate bot can send messages
+        can_send = True
+        try:
+            guild = getattr(ch_obj, 'guild', None)
+            if guild is not None:
+                me = guild.me or ctx.me
+                perms = ch_obj.permissions_for(me)
+                can_send = bool(getattr(perms, 'send_messages', False))
+        except Exception:
+            pass
+        if not can_send:
+            return await ctx.send("I don't have permission to send messages in that channel/thread. Please choose another.")
+        USER_REMINDER_CHANNELS[ctx.author.id] = ch_obj.id
+        # Build friendly destination text
+        dest = "that channel"
+        try:
+            if isinstance(ch_obj, discord.Thread):
+                dest = f"thread '{ch_obj.name}'"
+            elif hasattr(ch_obj, 'name'):
+                dest = f"#{ch_obj.name}"
+        except Exception:
+            pass
+        await ctx.send(f"{ctx.author.mention} Your reminders will now be sent to {dest}.")
+    except Exception as ex:
+        logging.exception("Failed to set reminders channel: %s", ex)
+        await ctx.send("Sorry, I couldn't set your reminders channel right now.")
+
+
 @bot.command(name="remindeveryday", help="Set a recurring daily reminder: !remindeveryday [HH:MM] <message>. Uses your set time zone for specific times.")
 async def remindeveryday(ctx, *, message: str = None):
     """
@@ -492,6 +604,9 @@ async def remindeveryday(ctx, *, message: str = None):
             initial_delay = max(0, (next_run - datetime.now()).total_seconds())
             await asyncio.sleep(initial_delay)
             while True:
+                # Stop if cancelled/removed
+                if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+                    break
                 try:
                     await target_channel.send(f"{actual_message}\n{ctx.author.mention}")
                 except Exception as e:
@@ -506,6 +621,12 @@ async def remindeveryday(ctx, *, message: str = None):
                 except Exception:
                     next_sleep = 24 * 3600
                 await asyncio.sleep(next_sleep)
+            # Cleanup: ensure removed from registry
+            try:
+                if entry in CURRENT_REMINDERS:
+                    CURRENT_REMINDERS.remove(entry)
+            except Exception:
+                pass
         except Exception as e:
             logging.exception("Daily recurring reminder loop ended: %s", e)
 
@@ -529,10 +650,41 @@ async def list_reminders(ctx):
             when = _humanize_time_until(nr) if isinstance(nr, datetime) else 'unknown time'
             lines.append(f"{idx}. [{typ}] {when} — {msg}")
         text = "Your current reminders:\n" + "\n".join(lines)
+        text += "\n\nTip: delete with !deletereminder <number> (see the numbers above)."
         await ctx.send(text)
     except Exception as ex:
         logging.exception("Failed to list reminders: %s", ex)
         await ctx.send("Sorry, I couldn't retrieve your reminders right now.")
+
+
+@bot.command(name="deletereminder", aliases=["delreminder", "rmreminder"], help="Delete one of your reminders by its number from !reminders")
+async def delete_reminder(ctx, index: int = None):
+    """Delete the invoking user's reminder by its 1-based index as shown in !reminders."""
+    try:
+        if index is None:
+            return await ctx.send("Usage: !deletereminder <number> (use !reminders to see the list)")
+        if index <= 0:
+            return await ctx.send("Please provide a positive number (1, 2, 3, ...).")
+        # Acquire the user's reminders in the same ordering as list_reminders
+        items = [e for e in CURRENT_REMINDERS if e.get('user_id') == ctx.author.id]
+        if not items:
+            return await ctx.send(f"{ctx.author.mention} you have no reminders to delete.")
+        items.sort(key=lambda e: e.get('next_run') or datetime.max)
+        if index > len(items):
+            return await ctx.send(f"Invalid number. You currently have {len(items)} reminder(s).")
+        entry = items[index - 1]
+        # Mark cancelled and remove from registry
+        entry['cancelled'] = True
+        try:
+            CURRENT_REMINDERS.remove(entry)
+        except ValueError:
+            pass
+        msg = entry.get('message', '')
+        typ = entry.get('type', 'once')
+        await ctx.send(f"Deleted reminder #{index} [{typ}]: {msg}")
+    except Exception as ex:
+        logging.exception("Failed to delete reminder: %s", ex)
+        await ctx.send("Sorry, I couldn't delete that reminder right now.")
 
 
 @bot.command(name="help", help="Show information about all commands")
@@ -555,11 +707,15 @@ async def help_command(ctx):
         "  - Examples: !remindeveryday drink water | !remindeveryday 08:30 drink water\n\n"
         f"{prefix}settimezone <IANA_tz>\n"
         "  - Set your time zone (e.g., America/New_York). Required for specific times.\n\n"
+        f"{prefix}setremindchannel [here|#channel|channel_id|thread_id]\n"
+        "  - Set the channel or thread where your reminders will be sent. Defaults to the current channel/thread.\n\n"
         f"{prefix}reminders\n"
         "  - List your current reminders and their next run time.\n\n"
+        f"{prefix}deletereminder <number>\n"
+        "  - Delete one of your reminders by its number as shown in !reminders.\n\n"
         "Notes:\n"
-        "- Reminders are posted in the 🗓️reminders channel (or #reminders) if available;\n"
-        "  otherwise they are posted in the command's channel.\n"
+        "- By default, reminders are sent to the channel or thread where you set them up.\n"
+        "- You can change the destination with !setremindchannel [here|#channel|channel_id|thread_id].\n"
         "- Reminders are in-memory only and will be lost if the bot restarts.\n"
         "- Times are approximate; across DST changes there may be slight shifts.\n"
         "- Reminder messages are delivered as your custom text with your mention on a new line.\n"
