@@ -1,6 +1,9 @@
 import discord
 from discord.ext import commands
 import logging
+from logging.handlers import RotatingFileHandler
+import random
+from collections import deque, defaultdict
 from dotenv import load_dotenv
 import os
 import asyncio
@@ -24,8 +27,9 @@ except ImportError:
 load_dotenv()
 DB_PATH = os.getenv('BOT_DB_PATH', 'botdata.sqlite3')
 TOKEN = os.getenv('DISCORD_TOKEN')
+LOG_LEVEL = getattr(logging, os.getenv('BOT_LOG_LEVEL', 'INFO').upper(), logging.INFO)
 
-handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
+handler = RotatingFileHandler(filename='discord.log', encoding='utf-8', maxBytes=5_000_000, backupCount=3)
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -41,7 +45,8 @@ def get_prefix(bot_obj, message):
         guild = getattr(message, 'guild', None)
         if guild and guild.id in GUILD_PREFIXES:
             return GUILD_PREFIXES[guild.id]
-    except Exception:
+    except AttributeError:
+        # No guild on this message; fall back to default
         pass
     return DEFAULT_PREFIX
 
@@ -109,10 +114,25 @@ async def init_db():
                 weekday INTEGER,
                 next_run TEXT,
                 created_at TEXT,
-                cancelled INTEGER DEFAULT 0
+                cancelled INTEGER DEFAULT 0,
+                paused INTEGER DEFAULT 0,
+                tags TEXT NULL
             )
             """
         )
+        # migrations: ensure columns paused and tags exist (idempotent)
+        try:
+            cur = await db.execute("PRAGMA table_info(reminders)")
+            cols = [row[1] for row in await cur.fetchall()]
+            if 'paused' not in cols:
+                await db.execute("ALTER TABLE reminders ADD COLUMN paused INTEGER DEFAULT 0")
+            if 'tags' not in cols:
+                await db.execute("ALTER TABLE reminders ADD COLUMN tags TEXT NULL")
+        except AioSqliteError as e:
+            logging.debug("DB migration check failed (non-fatal): %s", e)
+        # Helpful indices for common queries
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_reminders_user_cancelled ON reminders(user_id, cancelled)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_reminders_cancelled ON reminders(cancelled)")
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS guild_prefs (
@@ -153,14 +173,16 @@ async def insert_reminder(entry: dict) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
-            INSERT INTO reminders (user_id, type, message, tz, fixed_time, hour, minute, weekday, next_run, created_at, cancelled)
-            VALUES (?,?,?,?,?,?,?,?,?,?,0)
+            INSERT INTO reminders (user_id, type, message, tz, fixed_time, hour, minute, weekday, next_run, created_at, cancelled, paused, tags)
+            VALUES (?,?,?,?,?,?,?,?,?,?,0,?,?)
             """,
             (
                 entry.get('user_id'), entry.get('type'), entry.get('message'), entry.get('tz'),
                 1 if entry.get('fixed_time') else 0, entry.get('hour'), entry.get('minute'), entry.get('weekday'),
                 entry.get('next_run').isoformat() if entry.get('next_run') else None,
                 entry.get('created_at').isoformat() if entry.get('created_at') else None,
+                1 if entry.get('paused') else 0,
+                entry.get('tags'),
             )
         )
         await db.commit()
@@ -174,6 +196,16 @@ async def update_reminder_next_run(entry: dict):
         return
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE reminders SET next_run = ? WHERE id = ?", (entry.get('next_run').isoformat() if entry.get('next_run') else None, rid))
+        await db.commit()
+
+async def update_reminder_paused(entry: dict, paused: bool):
+    if not aiosqlite:
+        return
+    rid = entry.get('id')
+    if not rid:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE reminders SET paused = ? WHERE id = ?", (1 if paused else 0, rid))
         await db.commit()
 
 async def cancel_reminder(entry: dict):
@@ -191,8 +223,8 @@ async def load_active_reminders() -> list:
         return []
     out = []
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, user_id, type, message, tz, fixed_time, hour, minute, weekday, next_run, created_at FROM reminders WHERE cancelled = 0") as cur:
-            async for rid, user_id, rtype, message, tz, fixed_time, hour, minute, weekday, next_run, created_at in cur:
+        async with db.execute("SELECT id, user_id, type, message, tz, fixed_time, hour, minute, weekday, next_run, created_at, paused, tags FROM reminders WHERE cancelled = 0") as cur:
+            async for rid, user_id, rtype, message, tz, fixed_time, hour, minute, weekday, next_run, created_at, paused, tags in cur:
                 try:
                     entry = {
                         'id': rid,
@@ -206,6 +238,8 @@ async def load_active_reminders() -> list:
                         'weekday': weekday,
                         'next_run': datetime.fromisoformat(next_run) if next_run else None,
                         'created_at': datetime.fromisoformat(created_at) if created_at else datetime.now(),
+                        'paused': bool(paused),
+                        'tags': tags,
                     }
                     out.append(entry)
                 except (ValueError, TypeError) as e:
@@ -249,8 +283,12 @@ async def _schedule_once_noctx(entry: dict):
         due = entry.get('next_run') or (datetime.now() + timedelta(seconds=10))
         delay = max(0, (due - datetime.now()).total_seconds())
         await asyncio.sleep(delay)
+        # If paused, wait until unpaused without advancing
+        while entry.get('paused') and not entry.get('cancelled') and entry in CURRENT_REMINDERS:
+            await asyncio.sleep(30)
         if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
             return
+        await asyncio.sleep(random.uniform(0, 2))
         ch = await get_user_delivery_channel(entry.get('user_id'))
         if ch:
             await ch.send(f"{entry.get('message','')}\n<@{entry.get('user_id')}>")
@@ -274,6 +312,12 @@ async def _schedule_daily_noctx(entry: dict):
             await asyncio.sleep(delay)
             if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
                 break
+            # If paused, wait without advancing next_run
+            while entry.get('paused') and not entry.get('cancelled') and entry in CURRENT_REMINDERS:
+                await asyncio.sleep(30)
+            if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+                break
+            await asyncio.sleep(random.uniform(0, 2))
             ch = await get_user_delivery_channel(entry.get('user_id'))
             if ch:
                 try:
@@ -292,6 +336,8 @@ async def _schedule_daily_noctx(entry: dict):
                 await update_reminder_next_run(entry)
             except AioSqliteError:
                 pass
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logging.exception("Daily scheduler error: %s", e)
 
@@ -303,6 +349,12 @@ async def _schedule_weekly_noctx(entry: dict):
             await asyncio.sleep(delay)
             if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
                 break
+            # If paused, wait without advancing next_run
+            while entry.get('paused') and not entry.get('cancelled') and entry in CURRENT_REMINDERS:
+                await asyncio.sleep(30)
+            if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+                break
+            await asyncio.sleep(random.uniform(0, 2))
             ch = await get_user_delivery_channel(entry.get('user_id'))
             if ch:
                 try:
@@ -320,6 +372,8 @@ async def _schedule_weekly_noctx(entry: dict):
                 await update_reminder_next_run(entry)
             except AioSqliteError:
                 pass
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logging.exception("Weekly scheduler error: %s", e)
 
@@ -382,6 +436,91 @@ USER_TIMEZONES = {}
 # Maps user_id -> channel_or_thread_id (int)
 USER_REMINDER_CHANNELS = {}
 
+# Limits and rate limiting
+DEFAULT_LIMITS = {
+    'per_user_active': 50,
+    'per_user_per_guild': 30,
+    'per_guild_total': 2000,
+    'message_len': 500,
+    'max_one_time_horizon_days': 365,
+}
+
+# Simple in-memory counters for per-guild usage (creation time only; not persisted)
+GUILD_ACTIVE_COUNTS = defaultdict(int)  # guild_id -> active reminders count
+GUILD_USER_ACTIVE_COUNTS = defaultdict(lambda: defaultdict(int))  # guild_id -> (user_id -> count)
+
+# Token bucket: 10 actions per minute per user for create/edit/delete
+USER_ACTION_BUCKETS = defaultdict(deque)  # user_id -> deque[timestamps]
+ACTIONS_PER_MINUTE = 10
+
+
+def _rate_limit_check(user_id: int) -> bool:
+    now = datetime.now().timestamp()
+    dq = USER_ACTION_BUCKETS[user_id]
+    # drop entries older than 60s
+    while dq and now - dq[0] > 60:
+        dq.popleft()
+    if len(dq) >= ACTIONS_PER_MINUTE:
+        return False
+    dq.append(now)
+    return True
+
+
+def _count_user_active(user_id: int) -> int:
+    # Prefer DB if available
+    if aiosqlite:
+        # This is async normally, but for quick precheck we rely on in-memory; DB counts are used in diagnostics/limits display.
+        pass
+    return sum(1 for e in CURRENT_REMINDERS if e.get('user_id') == user_id and not e.get('cancelled'))
+
+
+def _enforce_limits_precreate(ctx, message_text: str, due: datetime | None, rtype: str) -> str | None:
+    """Return error string if a limit is violated; None if ok."""
+    # Message length
+    if message_text is None or len(message_text.strip()) == 0:
+        return "Please include a message."
+    if len(message_text) > DEFAULT_LIMITS['message_len']:
+        return f"Message too long. Please keep it under {DEFAULT_LIMITS['message_len']} characters."
+    # One-time horizon
+    if rtype == 'once' and due is not None:
+        horizon = (due - datetime.now()).total_seconds()
+        if horizon < MIN_DELAY:
+            return f"The time is too soon. Minimum delay is {MIN_DELAY}s."
+        max_horizon = DEFAULT_LIMITS['max_one_time_horizon_days'] * 86400
+        if horizon > max_horizon:
+            return f"The date/time is too far in the future. Max horizon is {DEFAULT_LIMITS['max_one_time_horizon_days']} days."
+    # Per-user active
+    user_active = _count_user_active(ctx.author.id)
+    if user_active >= DEFAULT_LIMITS['per_user_active']:
+        return (f"Limit reached: You have {user_active} active reminders (max {DEFAULT_LIMITS['per_user_active']}). "
+                f"Use `{getattr(ctx,'prefix','!')}reminders` and `{getattr(ctx,'prefix','!')}deletereminder <number>` to free some up.")
+    # Per-guild counts (in-memory only)
+    if getattr(ctx, 'guild', None) is not None:
+        gid = ctx.guild.id
+        per_user_guild = GUILD_USER_ACTIVE_COUNTS[gid][ctx.author.id]
+        if per_user_guild >= DEFAULT_LIMITS['per_user_per_guild']:
+            return (f"Server limit reached: You have {per_user_guild} active reminders in this server (max {DEFAULT_LIMITS['per_user_per_guild']}).")
+        guild_total = GUILD_ACTIVE_COUNTS[gid]
+        if guild_total >= DEFAULT_LIMITS['per_guild_total']:
+            return (f"Server is at capacity for reminders (max {DEFAULT_LIMITS['per_guild_total']}). Please try later or delete some.")
+    return None
+
+
+def _bump_guild_counters_on_create(ctx):
+    if getattr(ctx, 'guild', None) is not None:
+        gid = ctx.guild.id
+        GUILD_ACTIVE_COUNTS[gid] += 1
+        GUILD_USER_ACTIVE_COUNTS[gid][ctx.author.id] += 1
+
+
+def _dec_guild_counters_on_delete(ctx):
+    if getattr(ctx, 'guild', None) is not None:
+        gid = ctx.guild.id
+        if GUILD_ACTIVE_COUNTS[gid] > 0:
+            GUILD_ACTIVE_COUNTS[gid] -= 1
+        if GUILD_USER_ACTIVE_COUNTS[gid][ctx.author.id] > 0:
+            GUILD_USER_ACTIVE_COUNTS[gid][ctx.author.id] -= 1
+
 
 async def get_reminders_channel(ctx):
     """
@@ -414,8 +553,19 @@ async def get_reminders_channel(ctx):
                     pass
                 if can_send:
                     return ch
-        # Fallback to invoking channel
-        return ctx.channel
+        # Fallback to invoking channel; ensure we can send, else DM
+        ch = ctx.channel
+        try:
+            guild = getattr(ch, 'guild', None)
+            if guild is not None:
+                me = guild.me or ctx.me
+                perms = ch.permissions_for(me)
+                if not bool(getattr(perms, 'send_messages', False)):
+                    dm = await get_user_delivery_channel(user_id) if user_id else None
+                    return dm or ch
+        except AttributeError:
+            pass
+        return ch
     except Exception as e:
         logging.exception("Failed to resolve delivery channel: %s", e)
         return ctx.channel
@@ -452,6 +602,9 @@ async def remindme(ctx, when: str = None, *, message: str = None):
     """
     if when is None or message is None:
         return await ctx.send("Usage: !remindme <time|HH:MM> <message> (e.g., !remindme 15m check the oven | !remindme 08:30 drink water)")
+    # Rate limit
+    if not _rate_limit_check(ctx.author.id):
+        return await ctx.send("You're doing that too often. Please wait a bit before creating more reminders (10 actions/min).")
 
     # Try HH:MM first
     fixed = _parse_hhmm(when)
@@ -461,6 +614,10 @@ async def remindme(ctx, when: str = None, *, message: str = None):
         if not tz_name:
             return await ctx.send("Please set your time zone first with !settimezone <IANA_tz> (e.g., America/New_York).")
         due = _compute_next_one_time_fixed_run(hour, minute, tz_name)
+        # Limits check
+        err = _enforce_limits_precreate(ctx, message, due, 'once')
+        if err:
+            return await ctx.send(err)
         # Register in-memory
         entry = {
             'user_id': ctx.author.id,
@@ -472,8 +629,10 @@ async def remindme(ctx, when: str = None, *, message: str = None):
             'fixed_time': True,
             'hour': hour,
             'minute': minute,
+            'paused': False,
         }
         CURRENT_REMINDERS.append(entry)
+        _bump_guild_counters_on_create(ctx)
         try:
             rid = await insert_reminder(entry)
             if rid and rid > 0:
@@ -487,9 +646,13 @@ async def remindme(ctx, when: str = None, *, message: str = None):
             try:
                 delay = max(0, (due - datetime.now()).total_seconds())
                 await asyncio.sleep(delay)
+                # If paused, wait
+                while entry.get('paused') and not entry.get('cancelled') and entry in CURRENT_REMINDERS:
+                    await asyncio.sleep(30)
                 # Skip if cancelled or removed
                 if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
                     return
+                await asyncio.sleep(random.uniform(0, 2))
                 target_channel = await get_reminders_channel(ctx)
                 await target_channel.send(f"{message}\n{ctx.author.mention}")
             except asyncio.CancelledError:
@@ -501,6 +664,7 @@ async def remindme(ctx, when: str = None, *, message: str = None):
                     if entry in CURRENT_REMINDERS:
                         CURRENT_REMINDERS.remove(entry)
                     await cancel_reminder(entry)
+                    _dec_guild_counters_on_delete(ctx)
                 except Exception:
                     pass
         asyncio.create_task(deliver())
@@ -512,6 +676,10 @@ async def remindme(ctx, when: str = None, *, message: str = None):
         return await ctx.send(result)
 
     due = datetime.now() + timedelta(seconds=seconds)
+    # Limits check
+    err = _enforce_limits_precreate(ctx, message, due, 'once')
+    if err:
+        return await ctx.send(err)
     # Register in-memory
     entry = {
         'user_id': ctx.author.id,
@@ -519,8 +687,10 @@ async def remindme(ctx, when: str = None, *, message: str = None):
         'message': message,
         'next_run': due,
         'created_at': datetime.now(),
+        'paused': False,
     }
     CURRENT_REMINDERS.append(entry)
+    _bump_guild_counters_on_create(ctx)
     try:
         rid = await insert_reminder(entry)
         if rid and rid > 0:
@@ -534,10 +704,14 @@ async def remindme(ctx, when: str = None, *, message: str = None):
     async def deliver():
         try:
             await asyncio.sleep(seconds)
+            # If paused, wait
+            while entry.get('paused') and not entry.get('cancelled') and entry in CURRENT_REMINDERS:
+                await asyncio.sleep(30)
             # Skip if cancelled or removed
             if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
                 return
             # If the channel still exists and the bot can send messages, deliver it to the reminders channel.
+            await asyncio.sleep(random.uniform(0, 2))
             target_channel = await get_reminders_channel(ctx)
             await target_channel.send(f"{message}\n{ctx.author.mention}")
         except asyncio.CancelledError:
@@ -551,6 +725,7 @@ async def remindme(ctx, when: str = None, *, message: str = None):
                 if entry in CURRENT_REMINDERS:
                     CURRENT_REMINDERS.remove(entry)
                 await cancel_reminder(entry)
+                _dec_guild_counters_on_delete(ctx)
             except AioSqliteError:
                 pass
 
@@ -620,6 +795,9 @@ async def remindevery(ctx, weekday: str = None, *, message: str = None):
     """
     if weekday is None or message is None:
         return await ctx.send("Usage: !remindevery <weekday> [HH:MM] <message> (e.g., !remindevery friday 09:00 drink water)")
+    # Rate limit
+    if not _rate_limit_check(ctx.author.id):
+        return await ctx.send("You're doing that too often. Please wait a bit before creating more reminders (10 actions/min).")
 
     target_idx = parse_weekday(weekday)
     if target_idx is None:
@@ -647,6 +825,11 @@ async def remindevery(ctx, weekday: str = None, *, message: str = None):
         when_str = f"{next_run.strftime('%A')} at around {next_run.strftime('%H:%M')} (starting {next_run.strftime('%Y-%m-%d')})"
         tz_name = None
 
+    # Limits check
+    err = _enforce_limits_precreate(ctx, actual_message, None, 'weekly')
+    if err:
+        return await ctx.send(err)
+
     # Register in-memory
     entry = {
         'user_id': ctx.author.id,
@@ -659,13 +842,15 @@ async def remindevery(ctx, weekday: str = None, *, message: str = None):
         'hour': fixed_hour,
         'minute': fixed_min,
         'weekday': target_idx,
+        'paused': False,
     }
     CURRENT_REMINDERS.append(entry)
+    _bump_guild_counters_on_create(ctx)
     try:
         rid = await insert_reminder(entry)
         if rid and rid > 0:
             entry['id'] = rid
-    except Exception as e:
+    except AioSqliteError as e:
         logging.exception("Failed to persist weekly reminder: %s", e)
 
     await ctx.send(f"{ctx.author.mention} I will remind you every {when_str}. Message: {actual_message}")
@@ -679,9 +864,15 @@ async def remindevery(ctx, weekday: str = None, *, message: str = None):
                 # Stop if cancelled/removed
                 if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
                     break
+                # If paused, wait
+                while entry.get('paused') and not entry.get('cancelled') and entry in CURRENT_REMINDERS:
+                    await asyncio.sleep(30)
+                if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+                    break
                 try:
+                    await asyncio.sleep(random.uniform(0, 2))
                     await target_channel.send(f"{actual_message}\n{ctx.author.mention}")
-                except Exception as e:
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
                     logging.exception("Error delivering recurring reminder: %s", e)
                 # Update next occurrence and then sleep until next_run
                 try:
@@ -958,6 +1149,9 @@ async def remindeveryday(ctx, *, message: str = None):
     """
     if message is None or not message.strip():
         return await ctx.send("Usage: !remindeveryday [HH:MM] <message> (e.g., !remindeveryday 08:30 drink water)")
+    # Rate limit
+    if not _rate_limit_check(ctx.author.id):
+        return await ctx.send("You're doing that too often. Please wait a bit before creating more reminders (10 actions/min).")
 
     fixed_hour = fixed_min = None
     actual_message = message.strip()
@@ -982,6 +1176,11 @@ async def remindeveryday(ctx, *, message: str = None):
         when_str = f"every day at around {next_run.strftime('%H:%M')} (starting {next_run.strftime('%Y-%m-%d')})"
         tz_name = None
 
+    # Limits check (daily doesn't use horizon)
+    err = _enforce_limits_precreate(ctx, actual_message, None, 'daily')
+    if err:
+        return await ctx.send(err)
+
     # Register in-memory
     entry = {
         'user_id': ctx.author.id,
@@ -993,8 +1192,10 @@ async def remindeveryday(ctx, *, message: str = None):
         'fixed_time': fixed_hour is not None,
         'hour': fixed_hour,
         'minute': fixed_min,
+        'paused': False,
     }
     CURRENT_REMINDERS.append(entry)
+    _bump_guild_counters_on_create(ctx)
     try:
         rid = await insert_reminder(entry)
         if rid and rid > 0:
@@ -1013,7 +1214,13 @@ async def remindeveryday(ctx, *, message: str = None):
                 # Stop if cancelled/removed
                 if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
                     break
+                # If paused, wait
+                while entry.get('paused') and not entry.get('cancelled') and entry in CURRENT_REMINDERS:
+                    await asyncio.sleep(30)
+                if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+                    break
                 try:
+                    await asyncio.sleep(random.uniform(0, 2))
                     await target_channel.send(f"{actual_message}\n{ctx.author.mention}")
                 except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
                     logging.exception("Error delivering daily recurring reminder: %s", e)
@@ -1055,9 +1262,10 @@ async def list_reminders(ctx):
             msg = e.get('message', '')
             nr = e.get('next_run')
             when = _humanize_time_until(nr) if isinstance(nr, datetime) else 'unknown time'
-            lines.append(f"{idx}. [{typ}] {when} — {msg}")
+            paused = ' [paused]' if e.get('paused') else ''
+            lines.append(f"{idx}. [{typ}{paused}] {when} — {msg}")
         text = "Your current reminders:\n" + "\n".join(lines)
-        text += "\n\nTip: delete with !deletereminder <number>, or edit with !editreminder <number> <new message>."
+        text += "\n\nTip: delete with !deletereminder <number>, edit with !editreminder <number> <new message>, snooze with !snooze <number> <duration>, or pause/resume with !pausereminder/!resumereminder."
         await ctx.send(text)
     except Exception as ex:
         logging.exception("Failed to list reminders: %s", ex)
@@ -1068,6 +1276,9 @@ async def list_reminders(ctx):
 async def delete_reminder(ctx, index: int = None):
     """Delete the invoking user's reminder by its 1-based index as shown in !reminders."""
     try:
+        # Rate limit
+        if not _rate_limit_check(ctx.author.id):
+            return await ctx.send("You're doing that too often. Please wait a bit before modifying reminders (10 actions/min).")
         if index is None:
             return await ctx.send("Usage: !deletereminder <number> (use !reminders to see the list)")
         if index <= 0:
@@ -1090,6 +1301,7 @@ async def delete_reminder(ctx, index: int = None):
             await cancel_reminder(entry)
         except AioSqliteError as e:
             logging.exception("Failed to cancel reminder in DB: %s", e)
+        _dec_guild_counters_on_delete(ctx)
         msg = entry.get('message', '')
         typ = entry.get('type', 'once')
         await ctx.send(f"Deleted reminder #{index} [{typ}]: {msg}")
@@ -1160,7 +1372,7 @@ async def settings_command(ctx):
             embed.add_field(name="Configured delivery", value=ch_configured_display, inline=False)
             embed.add_field(name="Where this convo will deliver", value=resolved_display, inline=False)
             embed.add_field(name="Prefix", value=prefix_text, inline=False)
-            embed.set_footer(text="Change with: settimezone, setremindchannel, setprefix")
+            embed.set_footer(text="Change with: settimezone, setremindchannel, setprefix • View caps with: limits")
             return await ctx.send(embed=embed)
         except Exception:
             pass
@@ -1236,6 +1448,27 @@ async def help_command(ctx):
             f"Notes: Reminders are saved and survive restarts. Fixed-time reminders use your time zone (set with {prefix}settimezone). "
             "Across DST changes, times may shift slightly. Messages are delivered with your mention on a new line."
         ))
+        # Add Limits and QoL sections
+        embed.add_field(
+            name="Limits",
+            value=(
+                f"Default caps: per-user active {DEFAULT_LIMITS['per_user_active']}, per-user per-server {DEFAULT_LIMITS['per_user_per_guild']}, "
+                f"per-server total {DEFAULT_LIMITS['per_guild_total']}, message length {DEFAULT_LIMITS['message_len']} chars, "
+                f"one-time horizon {DEFAULT_LIMITS['max_one_time_horizon_days']} days.\n"
+                f"Use `{prefix}limits` to view your usage."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Quality of life",
+            value=(
+                f"• `{prefix}snooze <number> <duration>` — Snooze a reminder by a duration (e.g., 10m, 2h).\n"
+                f"• `{prefix}pausereminder <number>` / `{prefix}resumereminder <number>` — Pause/resume a reminder.\n"
+                f"• `{prefix}skipnext <number>` — Skip the next occurrence for a recurring reminder.\n"
+                f"• `{prefix}limits` — See your limits and current usage."
+            ),
+            inline=False,
+        )
         await ctx.send(embed=embed)
     except Exception:
         # Fallback to plain text if embeds fail for any reason
@@ -1252,8 +1485,7 @@ async def help_command(ctx):
             "  - Set a weekly recurring reminder on a given weekday (Mon/Tue/Wed/Thu/Fri/Sat/Sun).\n"
             f"  - Examples: {prefix}remindevery friday drink water | {prefix}remindevery fri 09:00 drink water\n\n"
             f"{prefix}remindeveryday [HH:MM] <message>\n"
-            "  - Set a daily recurring reminder. Optional HH:MM uses your set time zone.\n"
-            f"  - Examples: {prefix}remindeveryday drink water | {prefix}remindeveryday 08:30 drink water\n\n"
+            "  - Set a daily recurring reminder. Optional HH:MM uses your set time zone.\n\n"
             f"{prefix}settimezone <IANA_tz>\n"
             "  - Set your time zone (e.g., America/New_York). Required for specific times.\n\n"
             f"{prefix}setremindchannel [here|#channel|channel_id|thread_id]\n"
@@ -1268,6 +1500,14 @@ async def help_command(ctx):
             f"  - Delete one of your reminders by its number as shown in {prefix}reminders.\n\n"
             f"{prefix}editreminder <number> <new message>\n"
             f"  - Edit one of your reminders by its number as shown in {prefix}reminders.\n\n"
+            f"{prefix}snooze <number> <duration>\n"
+            "  - Snooze a reminder by a short duration (e.g., 10m, 2h).\n\n"
+            f"{prefix}pausereminder <number> / {prefix}resumereminder <number>\n"
+            "  - Pause or resume a reminder.\n\n"
+            f"{prefix}skipnext <number>\n"
+            "  - Skip the next occurrence for a recurring reminder.\n\n"
+            f"{prefix}limits\n"
+            "  - Show default caps and your current usage.\n\n"
             "Notes:\n"
             "- By default, reminders are sent to the channel or thread where you set them up.\n"
             f"- You can change the destination with {prefix}setremindchannel [here|#channel|channel_id|thread_id].\n"
@@ -1282,6 +1522,9 @@ async def help_command(ctx):
 async def edit_reminder(ctx, index: int = None, *, new_message: str = None):
     """Edit the invoking user's reminder message by its 1-based index as shown in !reminders."""
     try:
+        # Rate limit
+        if not _rate_limit_check(ctx.author.id):
+            return await ctx.send("You're doing that too often. Please wait a bit before modifying reminders (10 actions/min).")
         if index is None or new_message is None or not str(new_message).strip():
             return await ctx.send("Usage: !editreminder <number> <new message> (use !reminders to see the list)")
         if index <= 0:
@@ -1294,6 +1537,11 @@ async def edit_reminder(ctx, index: int = None, *, new_message: str = None):
         if index > len(items):
             return await ctx.send(f"Invalid number. You currently have {len(items)} reminder(s).")
         old = items[index - 1]
+        # Limits check for new message length only (no increase in counts)
+        err = _enforce_limits_precreate(ctx, str(new_message).strip(), None, old.get('type','once'))
+        if err and not err.startswith("Limit reached"):
+            # Ignore per-user count as we are replacing; enforce message/horizon constraints only
+            return await ctx.send(err)
         # Prepare new entry: copy schedule; change message
         new_entry = {
             'user_id': old.get('user_id'),
@@ -1306,6 +1554,7 @@ async def edit_reminder(ctx, index: int = None, *, new_message: str = None):
             'hour': old.get('hour'),
             'minute': old.get('minute'),
             'weekday': old.get('weekday'),
+            'paused': old.get('paused', False),
         }
         # Cancel old entry (memory + DB)
         try:
@@ -1360,6 +1609,9 @@ async def remind_on(ctx, *, args: str = None):
     try:
         if args is None or not args.strip():
             return await ctx.send("Usage: !remindon <YYYY-MM-DD> [HH:MM] <message>")
+        # Rate limit
+        if not _rate_limit_check(ctx.author.id):
+            return await ctx.send("You're doing that too often. Please wait a bit before creating more reminders (10 actions/min).")
         text = args.strip()
         # Parse date at the beginning
         m = re.match(r"^(\d{4})-(\d{2})-(\d{2})\s+(.*)$", text)
@@ -1396,6 +1648,10 @@ async def remind_on(ctx, *, args: str = None):
         # Validate future
         if due <= datetime.now():
             return await ctx.send("That date/time is in the past. Please provide a future date/time.")
+        # Limits
+        err = _enforce_limits_precreate(ctx, actual_message.strip(), due, 'once')
+        if err:
+            return await ctx.send(err)
         # Register entry
         entry = {
             'user_id': ctx.author.id,
@@ -1407,8 +1663,10 @@ async def remind_on(ctx, *, args: str = None):
             'fixed_time': True,
             'hour': hour,
             'minute': minute,
+            'paused': False,
         }
         CURRENT_REMINDERS.append(entry)
+        _bump_guild_counters_on_create(ctx)
         try:
             rid = await insert_reminder(entry)
             if rid and rid > 0:
@@ -1423,17 +1681,24 @@ async def remind_on(ctx, *, args: str = None):
             try:
                 delay = max(0, (due - datetime.now()).total_seconds())
                 await asyncio.sleep(delay)
+                # If paused, wait
+                while entry.get('paused') and not entry.get('cancelled') and entry in CURRENT_REMINDERS:
+                    await asyncio.sleep(30)
                 if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
                     return
+                await asyncio.sleep(random.uniform(0, 2))
                 target_channel = await get_reminders_channel(ctx)
                 await target_channel.send(f"{actual_message.strip()}\n{ctx.author.mention}")
-            except Exception as e:
+            except asyncio.CancelledError:
+                raise
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
                 logging.exception("Error delivering date reminder: %s", e)
             finally:
                 try:
                     if entry in CURRENT_REMINDERS:
                         CURRENT_REMINDERS.remove(entry)
                     await cancel_reminder(entry)
+                    _dec_guild_counters_on_delete(ctx)
                 except Exception:
                     pass
         asyncio.create_task(deliver())
@@ -1444,4 +1709,202 @@ async def remind_on(ctx, *, args: str = None):
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN is not set. Please configure it in your environment or .env file as DISCORD_TOKEN.")
 
-bot.run(TOKEN, log_handler=handler, log_level=logging.DEBUG)
+bot.run(TOKEN, log_handler=handler, log_level=LOG_LEVEL)
+
+
+# --- Additional helper and commands: limits, snooze, pause/resume, skipnext, diagnostics ---
+
+def _get_user_reminders_sorted(user_id: int):
+    items = [e for e in CURRENT_REMINDERS if e.get('user_id') == user_id and not e.get('cancelled')]
+    items.sort(key=lambda e: e.get('next_run') or datetime.max)
+    return items
+
+
+@bot.command(name="limits", help="Show your current reminder limits and usage")
+async def limits_command(ctx):
+    try:
+        user_count = _count_user_active(ctx.author.id)
+        if getattr(ctx, 'guild', None) is not None:
+            gid = ctx.guild.id
+            per_user_guild = GUILD_USER_ACTIVE_COUNTS[gid][ctx.author.id]
+            guild_total = GUILD_ACTIVE_COUNTS[gid]
+        else:
+            per_user_guild = user_count
+            guild_total = user_count
+        # Build embed
+        try:
+            embed = discord.Embed(title="Your Limits & Usage", color=discord.Color(0x3B8D6F))
+            embed.add_field(name="Per-user active", value=f"{user_count} / {DEFAULT_LIMITS['per_user_active']}", inline=False)
+            if getattr(ctx, 'guild', None) is not None:
+                embed.add_field(name="Per-user in this server", value=f"{per_user_guild} / {DEFAULT_LIMITS['per_user_per_guild']}", inline=False)
+                embed.add_field(name="Server total (in-memory)", value=f"{guild_total} / {DEFAULT_LIMITS['per_guild_total']}", inline=False)
+            embed.add_field(name="Message length", value=f"<= {DEFAULT_LIMITS['message_len']} characters", inline=False)
+            embed.add_field(name="One-time horizon", value=f"<= {DEFAULT_LIMITS['max_one_time_horizon_days']} days", inline=False)
+            embed.set_footer(text="These limits help prevent abuse. Contact the server admin for potential adjustments.")
+            return await ctx.send(embed=embed)
+        except Exception:
+            pass
+        # Plain text fallback
+        lines = [
+            f"Per-user active: {user_count} / {DEFAULT_LIMITS['per_user_active']}",
+        ]
+        if getattr(ctx, 'guild', None) is not None:
+            lines.append(f"Per-user in this server: {per_user_guild} / {DEFAULT_LIMITS['per_user_per_guild']}")
+            lines.append(f"Server total (in-memory): {guild_total} / {DEFAULT_LIMITS['per_guild_total']}")
+        lines.append(f"Message length: <= {DEFAULT_LIMITS['message_len']} characters")
+        lines.append(f"One-time horizon: <= {DEFAULT_LIMITS['max_one_time_horizon_days']} days")
+        await ctx.send("Your Limits & Usage:\n" + "\n".join(lines))
+    except Exception as e:
+        logging.exception("Failed to show limits: %s", e)
+        await ctx.send("Sorry, I couldn't retrieve limits right now.")
+
+
+@bot.command(name="snooze", help="Snooze a reminder by a short duration: snooze <number> <duration>")
+async def snooze_command(ctx, index: int = None, duration: str = None):
+    try:
+        if not _rate_limit_check(ctx.author.id):
+            return await ctx.send("You're doing that too often. Please wait a bit before modifying reminders (10 actions/min).")
+        if index is None or duration is None:
+            return await ctx.send("Usage: !snooze <number> <duration> (e.g., !snooze 1 10m)")
+        if index <= 0:
+            return await ctx.send("Please provide a positive number (1, 2, 3, ...).")
+        seconds, pretty = parse_duration(duration)
+        if seconds is None:
+            return await ctx.send(pretty)
+        items = _get_user_reminders_sorted(ctx.author.id)
+        if not items:
+            return await ctx.send("You have no reminders to snooze.")
+        if index > len(items):
+            return await ctx.send(f"Invalid number. You currently have {len(items)} reminder(s).")
+        entry = items[index - 1]
+        # Adjust next_run
+        base = entry.get('next_run') or datetime.now()
+        new_due = base + timedelta(seconds=seconds)
+        # Clamp to min delay from now
+        if (new_due - datetime.now()).total_seconds() < MIN_DELAY:
+            new_due = datetime.now() + timedelta(seconds=MIN_DELAY)
+        entry['next_run'] = new_due
+        try:
+            await update_reminder_next_run(entry)
+        except AioSqliteError:
+            pass
+        await ctx.send(f"Snoozed reminder #{index} by {pretty}. New time: {_humanize_time_until(new_due)}")
+    except Exception as e:
+        logging.exception("Failed to snooze reminder: %s", e)
+        await ctx.send("Sorry, I couldn't snooze that reminder right now.")
+
+
+@bot.command(name="pausereminder", aliases=["pause"], help="Pause a reminder: pausereminder <number>")
+async def pause_reminder_cmd(ctx, index: int = None):
+    try:
+        if not _rate_limit_check(ctx.author.id):
+            return await ctx.send("You're doing that too often. Please wait a bit before modifying reminders (10 actions/min).")
+        if index is None:
+            return await ctx.send("Usage: !pausereminder <number>")
+        if index <= 0:
+            return await ctx.send("Please provide a positive number (1, 2, 3, ...).")
+        items = _get_user_reminders_sorted(ctx.author.id)
+        if not items:
+            return await ctx.send("You have no reminders to pause.")
+        if index > len(items):
+            return await ctx.send(f"Invalid number. You currently have {len(items)} reminder(s).")
+        entry = items[index - 1]
+        entry['paused'] = True
+        try:
+            await update_reminder_paused(entry, True)
+        except AioSqliteError:
+            pass
+        await ctx.send(f"Paused reminder #{index}.")
+    except Exception as e:
+        logging.exception("Failed to pause reminder: %s", e)
+        await ctx.send("Sorry, I couldn't pause that reminder right now.")
+
+
+@bot.command(name="resumereminder", aliases=["resume"], help="Resume a paused reminder: resumereminder <number>")
+async def resume_reminder_cmd(ctx, index: int = None):
+    try:
+        if not _rate_limit_check(ctx.author.id):
+            return await ctx.send("You're doing that too often. Please wait a bit before modifying reminders (10 actions/min).")
+        if index is None:
+            return await ctx.send("Usage: !resumereminder <number>")
+        if index <= 0:
+            return await ctx.send("Please provide a positive number (1, 2, 3, ...).")
+        items = _get_user_reminders_sorted(ctx.author.id)
+        if not items:
+            return await ctx.send("You have no reminders to resume.")
+        if index > len(items):
+            return await ctx.send(f"Invalid number. You currently have {len(items)} reminder(s).")
+        entry = items[index - 1]
+        entry['paused'] = False
+        try:
+            await update_reminder_paused(entry, False)
+        except AioSqliteError:
+            pass
+        await ctx.send(f"Resumed reminder #{index}.")
+    except Exception as e:
+        logging.exception("Failed to resume reminder: %s", e)
+        await ctx.send("Sorry, I couldn't resume that reminder right now.")
+
+
+@bot.command(name="skipnext", help="Skip the next occurrence for a recurring reminder: skipnext <number>")
+async def skipnext_command(ctx, index: int = None):
+    try:
+        if not _rate_limit_check(ctx.author.id):
+            return await ctx.send("You're doing that too often. Please wait a bit before modifying reminders (10 actions/min).")
+        if index is None:
+            return await ctx.send("Usage: !skipnext <number>")
+        if index <= 0:
+            return await ctx.send("Please provide a positive number (1, 2, 3, ...).")
+        items = _get_user_reminders_sorted(ctx.author.id)
+        if not items:
+            return await ctx.send("You have no reminders to modify.")
+        if index > len(items):
+            return await ctx.send(f"Invalid number. You currently have {len(items)} reminder(s).")
+        entry = items[index - 1]
+        rtype = entry.get('type')
+        if rtype not in ('daily', 'weekly'):
+            return await ctx.send("Skip-next only applies to recurring reminders (daily/weekly).")
+        if rtype == 'daily':
+            entry['next_run'] = (entry.get('next_run') or datetime.now()) + timedelta(days=1)
+        else:
+            entry['next_run'] = (entry.get('next_run') or datetime.now()) + timedelta(days=7)
+        try:
+            await update_reminder_next_run(entry)
+        except AioSqliteError:
+            pass
+        when_text = _humanize_time_until(entry['next_run']) if isinstance(entry['next_run'], datetime) else 'unknown time'
+        await ctx.send(f"Skipped next occurrence. New next time: {when_text}")
+    except Exception as e:
+        logging.exception("Failed to skip next: %s", e)
+        await ctx.send("Sorry, I couldn't skip the next occurrence right now.")
+
+
+@bot.command(name="diagnostics", help="Owner-only diagnostics of DB schema and limits")
+async def diagnostics_command(ctx):
+    try:
+        try:
+            is_owner = await bot.is_owner(ctx.author)
+        except Exception:
+            is_owner = False
+        if not is_owner:
+            return await ctx.send("This command is owner-only.")
+        has_paused = has_tags = False
+        if aiosqlite:
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cur = await db.execute("PRAGMA table_info(reminders)")
+                    cols = [row[1] for row in await cur.fetchall()]
+                    has_paused = 'paused' in cols
+                    has_tags = 'tags' in cols
+            except Exception as e:
+                logging.exception("Diagnostics schema check failed: %s", e)
+        user_count = _count_user_active(ctx.author.id)
+        msg = (
+            f"Schema: paused={'yes' if has_paused else 'no'}, tags={'yes' if has_tags else 'no'}\n"
+            f"Limits: per_user_active={DEFAULT_LIMITS['per_user_active']}, per_user_per_guild={DEFAULT_LIMITS['per_user_per_guild']}, per_guild_total={DEFAULT_LIMITS['per_guild_total']}, msg_len={DEFAULT_LIMITS['message_len']}, horizon_days={DEFAULT_LIMITS['max_one_time_horizon_days']}\n"
+            f"Your active reminders: {user_count}"
+        )
+        await ctx.send(msg)
+    except Exception as e:
+        logging.exception("Diagnostics failed: %s", e)
+        await ctx.send("Diagnostics failed.")
