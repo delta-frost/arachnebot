@@ -30,7 +30,53 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+# Dynamic command prefix support
+DEFAULT_PREFIX = '!'
+# Maps guild_id -> prefix (persisted in DB); DMs use DEFAULT_PREFIX
+GUILD_PREFIXES = {}
+
+
+def get_prefix(bot_obj, message):
+    try:
+        guild = getattr(message, 'guild', None)
+        if guild and guild.id in GUILD_PREFIXES:
+            return GUILD_PREFIXES[guild.id]
+    except Exception:
+        pass
+    return DEFAULT_PREFIX
+
+
+async def load_guild_prefixes():
+    if not aiosqlite:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT guild_id, prefix FROM guild_prefs") as cur:
+            async for gid, pref in cur:
+                if gid and pref:
+                    GUILD_PREFIXES[int(gid)] = str(pref)
+
+
+async def upsert_guild_prefix(guild_id: int, prefix: str):
+    if not aiosqlite:
+        GUILD_PREFIXES[guild_id] = prefix
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("REPLACE INTO guild_prefs(guild_id, prefix) VALUES(?,?)", (guild_id, prefix))
+        await db.commit()
+        GUILD_PREFIXES[guild_id] = prefix
+
+
+async def clear_guild_prefix(guild_id: int):
+    if not aiosqlite:
+        GUILD_PREFIXES.pop(guild_id, None)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM guild_prefs WHERE guild_id = ?", (guild_id,))
+        await db.commit()
+        GUILD_PREFIXES.pop(guild_id, None)
+
+
+bot = commands.Bot(command_prefix=get_prefix, intents=intents)
 bot.remove_command('help')
 
 # --- Persistence helpers ---
@@ -64,6 +110,14 @@ async def init_db():
                 next_run TEXT,
                 created_at TEXT,
                 cancelled INTEGER DEFAULT 0
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_prefs (
+                guild_id INTEGER PRIMARY KEY,
+                prefix TEXT
             )
             """
         )
@@ -275,6 +329,7 @@ async def on_ready():
     try:
         await init_db()
         await load_users_into_memory()
+        await load_guild_prefixes()
         entries = await load_active_reminders()
         await schedule_loaded_entries(entries)
         print(f"Loaded {len(entries)} reminders from DB")
@@ -858,6 +913,41 @@ async def setchannel(ctx, *, target: str = None):
         await ctx.send("Sorry, I couldn't set your reminders channel right now.")
 
 
+@bot.command(name="setprefix", help="Change the bot's command prefix for this server: !setprefix <new_prefix> | reset")
+async def setprefix(ctx, *, new_prefix: str = None):
+    """
+    Change the bot's command prefix for the current server.
+    - Usage: <prefix>setprefix <new_prefix>
+    - Use 'reset' to restore the default prefix.
+    - Only available in servers, and requires Manage Guild or Administrator permission (or be the server owner).
+    """
+    try:
+        if ctx.guild is None:
+            return await ctx.send("This command can only be used in a server (not in DMs).")
+        # Permission check
+        is_owner = ctx.author.id == getattr(ctx.guild, 'owner_id', 0)
+        perms = getattr(ctx.author, 'guild_permissions', None)
+        has_perm = bool(perms.administrator or perms.manage_guild) if perms else False
+        if not (is_owner or has_perm):
+            return await ctx.send("You need Administrator or Manage Server permission to change the prefix.")
+        if new_prefix is None or not str(new_prefix).strip():
+            current = GUILD_PREFIXES.get(ctx.guild.id, DEFAULT_PREFIX)
+            return await ctx.send(f"Usage: {getattr(ctx, 'prefix', DEFAULT_PREFIX)}setprefix <new_prefix> | reset\nCurrent prefix here: `{current}`")
+        token = str(new_prefix).strip()
+        # Allow reset keywords
+        if token.lower() in {"reset", "default", "clear"}:
+            await clear_guild_prefix(ctx.guild.id)
+            return await ctx.send(f"Prefix reset to default: `{DEFAULT_PREFIX}`")
+        # Basic validation: 1-5 visible non-whitespace characters
+        if len(token) < 1 or len(token) > 5 or any(ch.isspace() for ch in token):
+            return await ctx.send("Please choose a prefix of 1–5 non‑whitespace characters (e.g., !, ?, $, .).")
+        await upsert_guild_prefix(ctx.guild.id, token)
+        return await ctx.send(f"Prefix updated for this server: `{token}`. Try `{token}help`.")
+    except Exception as e:
+        logging.exception("Failed to set prefix: %s", e)
+        await ctx.send("Sorry, I couldn't change the prefix right now.")
+
+
 @bot.command(name="remindeveryday", help="Set a recurring daily reminder: !remindeveryday [HH:MM] <message>. Uses your set time zone for specific times.")
 async def remindeveryday(ctx, *, message: str = None):
     """
@@ -1013,12 +1103,12 @@ async def help_command(ctx):
     """
     Display help for all available commands with usage examples and notes.
     """
-    prefix = '!'
+    prefix = getattr(ctx, 'prefix', DEFAULT_PREFIX)
     try:
         embed = discord.Embed(
-            title="Reminder Bot Help",
-            description="Friendly commands to help you remember things. Use the buttons below... just kidding — use the commands below!",
-            color=discord.Color.blurple()
+            title="Arachne Command List",
+            description="There are multiple reminder commands. Please review each carefully and choose the one best suited to your task.",
+            color=discord.Color(0x3B8D6F)
         )
         embed.add_field(
             name="One‑time reminders",
@@ -1026,10 +1116,10 @@ async def help_command(ctx):
                 f"• `{prefix}remindme <time|HH:MM> <message>`\n"
                 "  Set a one‑time reminder after a delay, or at a specific time today/tomorrow.\n"
                 "  Supports `s`/`m`/`h`/`d` (e.g., `30s`, `10m`, `2h`, `1d`).\n"
-                "  Examples: `!remindme 30s stretch`, `!remindme 10m drink water`, `!remindme 08:15 stand up`\n\n"
+                f"  Examples: `{prefix}remindme 30s stretch`, `{prefix}remindme 10m drink water`, `{prefix}remindme 08:15 stand up`\n\n"
                 f"• `{prefix}remindon <YYYY-MM-DD> [HH:MM] <message>`\n"
                 "  Set a one‑time reminder for a specific calendar date (optionally a time).\n"
-                "  Examples: `!remindon 2025-12-31 Celebrate!`, `!remindon 2025-12-31 09:00 Wish happy new year`"
+                f"  Examples: `{prefix}remindon 2025-12-31 Celebrate!`, `{prefix}remindon 2025-12-31 09:00 Wish happy new year`"
             ),
             inline=False,
         )
@@ -1038,7 +1128,7 @@ async def help_command(ctx):
             value=(
                 f"• `{prefix}remindevery <weekday> [HH:MM] <message>`\n"
                 "  Weekly reminder on the given weekday (Mon/Tue/Wed/Thu/Fri/Sat/Sun).\n"
-                "  Examples: `!remindevery friday drink water`, `!remindevery fri 09:00 drink water`\n\n"
+                f"  Examples: `{prefix}remindevery friday drink water`, `{prefix}remindevery fri 09:00 drink water`\n\n"
                 f"• `{prefix}remindeveryday [HH:MM] <message>`\n"
                 "  Daily reminder. If you specify `HH:MM`, your time zone is used."
             ),
@@ -1057,12 +1147,13 @@ async def help_command(ctx):
             name="Settings",
             value=(
                 f"• `{prefix}settimezone <IANA_tz>` — Set your time zone (e.g., `America/New_York`)\n"
-                f"• `{prefix}setremindchannel [here|#channel|channel_id|thread_id]` — Choose where reminders are sent"
+                f"• `{prefix}setremindchannel [here|#channel|channel_id|thread_id]` — Choose where reminders are sent\n"
+                f"• `{prefix}setprefix <new_prefix>` — Change the bot's command prefix for this server"
             ),
             inline=False,
         )
         embed.set_footer(text=(
-            "Notes: Reminders are saved and survive restarts. Fixed-time reminders use your time zone (set with !settimezone). "
+            f"Notes: Reminders are saved and survive restarts. Fixed-time reminders use your time zone (set with {prefix}settimezone). "
             "Across DST changes, times may shift slightly. Messages are delivered with your mention on a new line."
         ))
         await ctx.send(embed=embed)
@@ -1073,33 +1164,35 @@ async def help_command(ctx):
             f"{prefix}remindme <time|HH:MM> <message>\n"
             "  - Set a one-time reminder after a delay, or at a specific time today/tomorrow in your time zone.\n"
             "  - Duration supports: s (seconds), m (minutes), h (hours), d (days).\n"
-            "  - Examples: !remindme 30s stretch | !remindme 10m drink water | !remindme 08:15 stand up\n\n"
+            f"  - Examples: {prefix}remindme 30s stretch | {prefix}remindme 10m drink water | {prefix}remindme 08:15 stand up\n\n"
             f"{prefix}remindon <YYYY-MM-DD> [HH:MM] <message>\n"
             "  - Set a one-time reminder for a specific calendar date (optionally time). Uses your time zone if set.\n"
-            "  - Examples: !remindon 2025-12-31 Celebrate! | !remindon 2025-12-31 09:00 Wish happy new year\n\n"
+            f"  - Examples: {prefix}remindon 2025-12-31 Celebrate! | {prefix}remindon 2025-12-31 09:00 Wish happy new year\n\n"
             f"{prefix}remindevery <weekday> [HH:MM] <message>\n"
             "  - Set a weekly recurring reminder on a given weekday (Mon/Tue/Wed/Thu/Fri/Sat/Sun).\n"
-            "  - Examples: !remindevery friday drink water | !remindevery fri 09:00 drink water\n\n"
+            f"  - Examples: {prefix}remindevery friday drink water | {prefix}remindevery fri 09:00 drink water\n\n"
             f"{prefix}remindeveryday [HH:MM] <message>\n"
             "  - Set a daily recurring reminder. Optional HH:MM uses your set time zone.\n"
-            "  - Examples: !remindeveryday drink water | !remindeveryday 08:30 drink water\n\n"
+            f"  - Examples: {prefix}remindeveryday drink water | {prefix}remindeveryday 08:30 drink water\n\n"
             f"{prefix}settimezone <IANA_tz>\n"
             "  - Set your time zone (e.g., America/New_York). Required for specific times.\n\n"
             f"{prefix}setremindchannel [here|#channel|channel_id|thread_id]\n"
             "  - Set the channel or thread where your reminders will be sent. Defaults to the current channel/thread.\n\n"
+            f"{prefix}setprefix <new_prefix>\n"
+            "  - Change the bot's command prefix for this server.\n\n"
             f"{prefix}reminders\n"
             "  - List your current reminders and their next run time.\n\n"
             f"{prefix}deletereminder <number>\n"
-            "  - Delete one of your reminders by its number as shown in !reminders.\n\n"
+            f"  - Delete one of your reminders by its number as shown in {prefix}reminders.\n\n"
             f"{prefix}editreminder <number> <new message>\n"
-            "  - Edit one of your reminders by its number as shown in !reminders.\n\n"
+            f"  - Edit one of your reminders by its number as shown in {prefix}reminders.\n\n"
             "Notes:\n"
             "- By default, reminders are sent to the channel or thread where you set them up.\n"
-            "- You can change the destination with !setremindchannel [here|#channel|channel_id|thread_id].\n"
+            f"- You can change the destination with {prefix}setremindchannel [here|#channel|channel_id|thread_id].\n"
             "- Reminders are saved to a database and survive bot restarts.\n"
             "- Times are approximate; across DST changes there may be slight shifts.\n"
             "- Reminder messages are delivered as your custom text with your mention on a new line.\n"
-            "- Fixed-time reminders use your time zone; set it via !settimezone."
+            f"- Fixed-time reminders use your time zone; set it via {prefix}settimezone."
         )
         await ctx.send(help_text)
 
