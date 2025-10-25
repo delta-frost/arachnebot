@@ -11,7 +11,14 @@ try:
 except Exception:
     ZoneInfo = None  # Fallback: specific-time daily reminders will be unavailable without zoneinfo
 
+# Optional async SQLite for persistence
+try:
+    import aiosqlite
+except Exception:
+    aiosqlite = None
+
 load_dotenv()
+DB_PATH = os.getenv('BOT_DB_PATH', 'botdata.sqlite3')
 TOKEN = os.getenv('DISCORD_TOKEN')
 
 handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
@@ -22,9 +29,245 @@ intents.members = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 bot.remove_command('help')
 
+# --- Persistence helpers ---
+async def init_db():
+    if not aiosqlite:
+        logging.warning("aiosqlite not installed; running in in-memory mode only.")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                tz TEXT,
+                channel_id INTEGER
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                tz TEXT,
+                fixed_time INTEGER,
+                hour INTEGER,
+                minute INTEGER,
+                weekday INTEGER,
+                next_run TEXT,
+                created_at TEXT,
+                cancelled INTEGER DEFAULT 0
+            )
+            """
+        )
+        await db.commit()
+
+async def upsert_user_settings(user_id: int, tz: str = None, channel_id: int = None):
+    if not aiosqlite:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Merge existing
+        cur = await db.execute("SELECT tz, channel_id FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        old_tz, old_ch = (row[0], row[1]) if row else (None, None)
+        new_tz = tz if tz is not None else old_tz
+        new_ch = channel_id if channel_id is not None else old_ch
+        await db.execute("REPLACE INTO users(user_id, tz, channel_id) VALUES(?,?,?)", (user_id, new_tz, new_ch))
+        await db.commit()
+
+async def load_users_into_memory():
+    if not aiosqlite:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id, tz, channel_id FROM users") as cur:
+            async for user_id, tz, channel_id in cur:
+                if tz:
+                    USER_TIMEZONES[user_id] = tz
+                if channel_id:
+                    USER_REMINDER_CHANNELS[user_id] = channel_id
+
+async def insert_reminder(entry: dict) -> int:
+    if not aiosqlite:
+        return -1
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO reminders (user_id, type, message, tz, fixed_time, hour, minute, weekday, next_run, created_at, cancelled)
+            VALUES (?,?,?,?,?,?,?,?,?,?,0)
+            """,
+            (
+                entry.get('user_id'), entry.get('type'), entry.get('message'), entry.get('tz'),
+                1 if entry.get('fixed_time') else 0, entry.get('hour'), entry.get('minute'), entry.get('weekday'),
+                entry.get('next_run').isoformat() if entry.get('next_run') else None,
+                entry.get('created_at').isoformat() if entry.get('created_at') else None,
+            )
+        )
+        await db.commit()
+        return cur.lastrowid or -1
+
+async def update_reminder_next_run(entry: dict):
+    if not aiosqlite:
+        return
+    rid = entry.get('id')
+    if not rid:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE reminders SET next_run = ? WHERE id = ?", (entry.get('next_run').isoformat() if entry.get('next_run') else None, rid))
+        await db.commit()
+
+async def cancel_reminder(entry: dict):
+    if not aiosqlite:
+        return
+    rid = entry.get('id')
+    if not rid:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE reminders SET cancelled = 1 WHERE id = ?", (rid,))
+        await db.commit()
+
+async def load_active_reminders() -> list:
+    if not aiosqlite:
+        return []
+    out = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT id, user_id, type, message, tz, fixed_time, hour, minute, weekday, next_run, created_at FROM reminders WHERE cancelled = 0") as cur:
+            async for rid, user_id, rtype, message, tz, fixed_time, hour, minute, weekday, next_run, created_at in cur:
+                try:
+                    entry = {
+                        'id': rid,
+                        'user_id': user_id,
+                        'type': rtype,
+                        'message': message,
+                        'tz': tz,
+                        'fixed_time': bool(fixed_time),
+                        'hour': hour,
+                        'minute': minute,
+                        'weekday': weekday,
+                        'next_run': datetime.fromisoformat(next_run) if next_run else None,
+                        'created_at': datetime.fromisoformat(created_at) if created_at else datetime.now(),
+                    }
+                    out.append(entry)
+                except Exception as e:
+                    logging.exception("Failed to parse reminder row: %s", e)
+    return out
+
+async def get_user_delivery_channel(user_id: int):
+    # Prefer configured channel/thread, else DM
+    try:
+        target_id = USER_REMINDER_CHANNELS.get(user_id)
+        if target_id:
+            ch = bot.get_channel(target_id)
+            if ch is None:
+                try:
+                    ch = await bot.fetch_channel(target_id)
+                except Exception:
+                    ch = None
+            if ch is not None:
+                return ch
+        # Fallback DM
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        if user:
+            dm = user.dm_channel or await user.create_dm(
+            return dm
+    except Exception as e:
+        logging.exception("Failed to resolve delivery channel for user %s: %s", user_id, e)
+    return None
+
+async def schedule_loaded_entries(entries: list):
+    for entry in entries:
+        CURRENT_REMINDERS.append(entry)
+        if entry.get('type') == 'once':
+            asyncio.create_task(_schedule_once_noctx(entry))
+        elif entry.get('type') == 'daily':
+            asyncio.create_task(_schedule_daily_noctx(entry))
+        elif entry.get('type') == 'weekly':
+            asyncio.create_task(_schedule_weekly_noctx(entry))
+
+async def _schedule_once_noctx(entry: dict):
+    try:
+        due = entry.get('next_run') or (datetime.now() + timedelta(seconds=10))
+        delay = max(0, (due - datetime.now()).total_seconds())
+        await asyncio.sleep(delay)
+        if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+            return
+        ch = await get_user_delivery_channel(entry.get('user_id'))
+        if ch:
+            await ch.send(f"{entry.get('message','')}\n<@{entry.get('user_id')}>")
+    except Exception as e:
+        logging.exception("Error delivering loaded one-time reminder: %s", e)
+    finally:
+        try:
+            if entry in CURRENT_REMINDERS:
+                CURRENT_REMINDERS.remove(entry)
+            await cancel_reminder(entry)
+        except Exception:
+            pass
+
+async def _schedule_daily_noctx(entry: dict):
+    try:
+        while True:
+            next_run = entry.get('next_run') or (datetime.now() + timedelta(days=1))
+            delay = max(0, (next_run - datetime.now()).total_seconds())
+            await asyncio.sleep(delay)
+            if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+                break
+            ch = await get_user_delivery_channel(entry.get('user_id'))
+            if ch:
+                try:
+                    await ch.send(f"{entry.get('message','')}\n<@{entry.get('user_id')}>")
+                except Exception as e:
+                    logging.exception("Daily reminder send failed: %s", e)
+            # Compute next
+            try:
+                if entry.get('fixed_time') and entry.get('tz'):
+                    entry['next_run'] = _compute_next_daily_fixed_run(entry['hour'], entry['minute'], entry['tz'])
+                else:
+                    entry['next_run'] = datetime.now() + timedelta(days=1)
+                await update_reminder_next_run(entry)
+            except Exception:
+                pass
+    except Exception as e:
+        logging.exception("Daily scheduler error: %s", e)
+
+async def _schedule_weekly_noctx(entry: dict):
+    try:
+        while True:
+            next_run = entry.get('next_run') or compute_next_weekday_run(datetime.now(), entry.get('weekday') or datetime.now().weekday())
+            delay = max(0, (next_run - datetime.now()).total_seconds())
+            await asyncio.sleep(delay)
+            if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+                break
+            ch = await get_user_delivery_channel(entry.get('user_id'))
+            if ch:
+                try:
+                    await ch.send(f"{entry.get('message','')}\n<@{entry.get('user_id')}>")
+                except Exception as e:
+                    logging.exception("Weekly reminder send failed: %s", e)
+            try:
+                if entry.get('fixed_time') and entry.get('tz') is not None:
+                    entry['next_run'] = _compute_next_weekly_fixed_run(entry['hour'], entry['minute'], entry['tz'], entry['weekday'])
+                else:
+                    entry['next_run'] = datetime.now() + timedelta(days=7)
+                await update_reminder_next_run(entry)
+            except Exception:
+                pass
+    except Exception as e:
+        logging.exception("Weekly scheduler error: %s", e)
+
 @bot.event
 async def on_ready():
     print(f"{bot.user.name} is ready to go")
+    try:
+        await init_db()
+        await load_users_into_memory()
+        entries = await load_active_reminders()
+        await schedule_loaded_entries(entries)
+        print(f"Loaded {len(entries)} reminders from DB")
+    except Exception as e:
+        logging.exception("Startup DB init/load failed: %s", e)
 
 @bot.event
 async def on_message(message):
@@ -166,6 +409,12 @@ async def remindme(ctx, when: str = None, *, message: str = None):
             'minute': minute,
         }
         CURRENT_REMINDERS.append(entry)
+        try:
+            rid = await insert_reminder(entry)
+            if rid and rid > 0:
+                entry['id'] = rid
+        except Exception as e:
+            logging.exception("Failed to persist one-time fixed reminder: %s", e)
         pretty_when = f"at {hour:02d}:{minute:02d} ({tz_name}) on {due.strftime('%Y-%m-%d')}"
         await ctx.send(f"{ctx.author.mention} I will remind you {pretty_when}: {message}")
 
@@ -184,6 +433,7 @@ async def remindme(ctx, when: str = None, *, message: str = None):
                 try:
                     if entry in CURRENT_REMINDERS:
                         CURRENT_REMINDERS.remove(entry)
+                    await cancel_reminder(entry)
                 except Exception:
                     pass
         asyncio.create_task(deliver())
@@ -204,6 +454,12 @@ async def remindme(ctx, when: str = None, *, message: str = None):
         'created_at': datetime.now(),
     }
     CURRENT_REMINDERS.append(entry)
+    try:
+        rid = await insert_reminder(entry)
+        if rid and rid > 0:
+            entry['id'] = rid
+    except Exception as e:
+        logging.exception("Failed to persist one-time reminder: %s", e)
 
     confirmation = f"{ctx.author.mention} I will remind you in {result}: {message}"
     await ctx.send(confirmation)
@@ -225,6 +481,7 @@ async def remindme(ctx, when: str = None, *, message: str = None):
             try:
                 if entry in CURRENT_REMINDERS:
                     CURRENT_REMINDERS.remove(entry)
+                await cancel_reminder(entry)
             except Exception:
                 pass
 
@@ -335,8 +592,14 @@ async def remindevery(ctx, weekday: str = None, *, message: str = None):
         'weekday': target_idx,
     }
     CURRENT_REMINDERS.append(entry)
+    try:
+        rid = await insert_reminder(entry)
+        if rid and rid > 0:
+            entry['id'] = rid
+    except Exception as e:
+        logging.exception("Failed to persist weekly reminder: %s", e)
 
-    await ctx.send(f"{ctx.author.mention} I will remind you every {when_str}. Note: reminders are in-memory and stop if the bot restarts. Message: {actual_message}")
+    await ctx.send(f"{ctx.author.mention} I will remind you every {when_str}. Message: {actual_message}")
 
     async def loop():
         try:
@@ -359,6 +622,7 @@ async def remindevery(ctx, weekday: str = None, *, message: str = None):
                     else:
                         entry['next_run'] = datetime.now() + timedelta(days=7)
                         next_sleep = 7 * 24 * 3600
+                    await update_reminder_next_run(entry)
                 except Exception:
                     next_sleep = 7 * 24 * 3600
                 # Sleep, but wake if cancelled by re-check after sleep
@@ -466,6 +730,10 @@ async def settimezone(ctx, tz: str = None):
     except Exception:
         return await ctx.send("Invalid time zone. Please provide a valid IANA tz (e.g., Europe/London, Asia/Kolkata).")
     USER_TIMEZONES[ctx.author.id] = tz
+    try:
+        await upsert_user_settings(ctx.author.id, tz=tz)
+    except Exception as e:
+        logging.exception("Failed to persist timezone: %s", e)
     await ctx.send(f"{ctx.author.mention} Your time zone has been set to {tz}.")
 
 
@@ -533,6 +801,10 @@ async def setchannel(ctx, *, target: str = None):
         if not can_send:
             return await ctx.send("I don't have permission to send messages in that channel/thread. Please choose another.")
         USER_REMINDER_CHANNELS[ctx.author.id] = ch_obj.id
+        try:
+            await upsert_user_settings(ctx.author.id, channel_id=ch_obj.id)
+        except Exception as e:
+            logging.exception("Failed to persist reminder channel: %s", e)
         # Build friendly destination text
         dest = "that channel"
         try:
@@ -595,8 +867,14 @@ async def remindeveryday(ctx, *, message: str = None):
         'minute': fixed_min,
     }
     CURRENT_REMINDERS.append(entry)
+    try:
+        rid = await insert_reminder(entry)
+        if rid and rid > 0:
+            entry['id'] = rid
+    except Exception as e:
+        logging.exception("Failed to persist daily reminder: %s", e)
 
-    await ctx.send(f"{ctx.author.mention} I will remind you {when_str}. Note: reminders are in-memory and stop if the bot restarts. Message: {actual_message}")
+    await ctx.send(f"{ctx.author.mention} I will remind you {when_str}. Message: {actual_message}")
 
     async def loop():
         try:
@@ -617,6 +895,7 @@ async def remindeveryday(ctx, *, message: str = None):
                         entry['next_run'] = _compute_next_daily_fixed_run(entry['hour'], entry['minute'], entry['tz'])
                     else:
                         entry['next_run'] = datetime.now() + timedelta(days=1)
+                    await update_reminder_next_run(entry)
                     next_sleep = max(0, (entry['next_run'] - datetime.now()).total_seconds())
                 except Exception:
                     next_sleep = 24 * 3600
@@ -650,7 +929,7 @@ async def list_reminders(ctx):
             when = _humanize_time_until(nr) if isinstance(nr, datetime) else 'unknown time'
             lines.append(f"{idx}. [{typ}] {when} — {msg}")
         text = "Your current reminders:\n" + "\n".join(lines)
-        text += "\n\nTip: delete with !deletereminder <number> (see the numbers above)."
+        text += "\n\nTip: delete with !deletereminder <number>, or edit with !editreminder <number> <new message>."
         await ctx.send(text)
     except Exception as ex:
         logging.exception("Failed to list reminders: %s", ex)
@@ -679,6 +958,10 @@ async def delete_reminder(ctx, index: int = None):
             CURRENT_REMINDERS.remove(entry)
         except ValueError:
             pass
+        try:
+            await cancel_reminder(entry)
+        except Exception as e:
+            logging.exception("Failed to cancel reminder in DB: %s", e)
         msg = entry.get('message', '')
         typ = entry.get('type', 'once')
         await ctx.send(f"Deleted reminder #{index} [{typ}]: {msg}")
@@ -713,14 +996,85 @@ async def help_command(ctx):
         "  - List your current reminders and their next run time.\n\n"
         f"{prefix}deletereminder <number>\n"
         "  - Delete one of your reminders by its number as shown in !reminders.\n\n"
+        f"{prefix}editreminder <number> <new message>\n"
+        "  - Edit one of your reminders by its number as shown in !reminders.\n\n"
         "Notes:\n"
         "- By default, reminders are sent to the channel or thread where you set them up.\n"
         "- You can change the destination with !setremindchannel [here|#channel|channel_id|thread_id].\n"
-        "- Reminders are in-memory only and will be lost if the bot restarts.\n"
+        "- Reminders are saved to a database and survive bot restarts.\n"
         "- Times are approximate; across DST changes there may be slight shifts.\n"
         "- Reminder messages are delivered as your custom text with your mention on a new line.\n"
         "- Fixed-time reminders use your time zone; set it via !settimezone."
     )
     await ctx.send(help_text)
+
+@bot.command(name="editreminder", aliases=["editrem", "edit"], help="Edit one of your reminders by its number from !reminders: !editreminder <number> <new message>")
+async def edit_reminder(ctx, index: int = None, *, new_message: str = None):
+    """Edit the invoking user's reminder message by its 1-based index as shown in !reminders."""
+    try:
+        if index is None or new_message is None or not str(new_message).strip():
+            return await ctx.send("Usage: !editreminder <number> <new message> (use !reminders to see the list)")
+        if index <= 0:
+            return await ctx.send("Please provide a positive number (1, 2, 3, ...).")
+        # Same ordering as list_reminders
+        items = [e for e in CURRENT_REMINDERS if e.get('user_id') == ctx.author.id]
+        if not items:
+            return await ctx.send(f"{ctx.author.mention} you have no reminders to edit.")
+        items.sort(key=lambda e: e.get('next_run') or datetime.max)
+        if index > len(items):
+            return await ctx.send(f"Invalid number. You currently have {len(items)} reminder(s).")
+        old = items[index - 1]
+        # Prepare new entry: copy schedule; change message
+        new_entry = {
+            'user_id': old.get('user_id'),
+            'type': old.get('type', 'once'),
+            'message': str(new_message).strip(),
+            'next_run': old.get('next_run'),
+            'created_at': datetime.now(),
+            'tz': old.get('tz'),
+            'fixed_time': old.get('fixed_time'),
+            'hour': old.get('hour'),
+            'minute': old.get('minute'),
+            'weekday': old.get('weekday'),
+        }
+        # Cancel old entry (memory + DB)
+        try:
+            old['cancelled'] = True
+            try:
+                CURRENT_REMINDERS.remove(old)
+            except ValueError:
+                pass
+            try:
+                await cancel_reminder(old)
+            except Exception as e:
+                logging.exception("Failed to cancel old reminder during edit: %s", e)
+        except Exception:
+            pass
+        # Add and persist new entry
+        CURRENT_REMINDERS.append(new_entry)
+        try:
+            rid = await insert_reminder(new_entry)
+            if rid and rid > 0:
+                new_entry['id'] = rid
+        except Exception as e:
+            logging.exception("Failed to persist edited reminder: %s", e)
+        # Schedule the new entry using no-ctx schedulers so it keeps running independent of this context
+        try:
+            rtype = new_entry.get('type')
+            if rtype == 'once':
+                asyncio.create_task(_schedule_once_noctx(new_entry))
+            elif rtype == 'daily':
+                asyncio.create_task(_schedule_daily_noctx(new_entry))
+            elif rtype == 'weekly':
+                asyncio.create_task(_schedule_weekly_noctx(new_entry))
+        except Exception as e:
+            logging.exception("Failed to schedule edited reminder: %s", e)
+        # Confirmation
+        when = new_entry.get('next_run')
+        when_text = _humanize_time_until(when) if isinstance(when, datetime) else 'unknown time'
+        await ctx.send(f"Updated reminder #{index} [{new_entry.get('type','once')}] — now: {when_text} — {new_entry.get('message','')}")
+    except Exception as ex:
+        logging.exception("Failed to edit reminder: %s", ex)
+        await ctx.send("Sorry, I couldn't edit that reminder right now.")
 
 bot.run(TOKEN, log_handler=handler, log_level=logging.DEBUG)
