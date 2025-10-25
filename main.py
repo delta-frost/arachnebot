@@ -170,7 +170,7 @@ async def get_user_delivery_channel(user_id: int):
         # Fallback DM
         user = bot.get_user(user_id) or await bot.fetch_user(user_id)
         if user:
-            dm = user.dm_channel or await user.create_dm(
+            dm = user.dm_channel or await user.create_dm()
             return dm
     except Exception as e:
         logging.exception("Failed to resolve delivery channel for user %s: %s", user_id, e)
