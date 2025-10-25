@@ -1397,8 +1397,8 @@ async def help_command(ctx):
     prefix = getattr(ctx, 'prefix', DEFAULT_PREFIX)
     try:
         embed = discord.Embed(
-            title="Arachne Command List",
-            description="There are multiple reminder commands. Please review each carefully and choose the one best suited to your task.",
+            title="Arachne Help",
+            description="Arachne is currently in a testing phase. Please review each command carefully. For additional support, contact PerfectSaturday.",
             color=discord.Color(0x3B8D6F)
         )
         embed.add_field(
@@ -1450,22 +1450,21 @@ async def help_command(ctx):
         ))
         # Add Limits and QoL sections
         embed.add_field(
+            name="Reminder Adjustments",
+            value=(
+                f"• `{prefix}snooze <number> <duration>` — Snooze a reminder by a duration (e.g., 10m, 2h).\n"
+                f"• `{prefix}pausereminder <number>` / `{prefix}resumereminder <number>` — Pause/resume a reminder.\n"
+                f"• `{prefix}skipnext <number>` — Skip the next occurrence for a recurring reminder."
+            ),
+            inline=False,
+        )
+        embed.add_field(
             name="Limits",
             value=(
                 f"Default caps: per-user active {DEFAULT_LIMITS['per_user_active']}, per-user per-server {DEFAULT_LIMITS['per_user_per_guild']}, "
                 f"per-server total {DEFAULT_LIMITS['per_guild_total']}, message length {DEFAULT_LIMITS['message_len']} chars, "
                 f"one-time horizon {DEFAULT_LIMITS['max_one_time_horizon_days']} days.\n"
                 f"Use `{prefix}limits` to view your usage."
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="Quality of life",
-            value=(
-                f"• `{prefix}snooze <number> <duration>` — Snooze a reminder by a duration (e.g., 10m, 2h).\n"
-                f"• `{prefix}pausereminder <number>` / `{prefix}resumereminder <number>` — Pause/resume a reminder.\n"
-                f"• `{prefix}skipnext <number>` — Skip the next occurrence for a recurring reminder.\n"
-                f"• `{prefix}limits` — See your limits and current usage."
             ),
             inline=False,
         )
@@ -1709,9 +1708,6 @@ async def remind_on(ctx, *, args: str = None):
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN is not set. Please configure it in your environment or .env file as DISCORD_TOKEN.")
 
-bot.run(TOKEN, log_handler=handler, log_level=LOG_LEVEL)
-
-
 # --- Additional helper and commands: limits, snooze, pause/resume, skipnext, diagnostics ---
 
 def _get_user_reminders_sorted(user_id: int):
@@ -1908,3 +1904,5 @@ async def diagnostics_command(ctx):
     except Exception as e:
         logging.exception("Diagnostics failed: %s", e)
         await ctx.send("Diagnostics failed.")
+
+bot.run(TOKEN, log_handler=handler, log_level=LOG_LEVEL)
