@@ -7,15 +7,19 @@ import asyncio
 import re
 from datetime import datetime, timedelta
 try:
-    from zoneinfo import ZoneInfo
-except Exception:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
     ZoneInfo = None  # Fallback: specific-time daily reminders will be unavailable without zoneinfo
+    ZoneInfoNotFoundError = Exception
 
 # Optional async SQLite for persistence
 try:
     import aiosqlite
-except Exception:
+    from aiosqlite import Error as AioSqliteError
+except ImportError:
     aiosqlite = None
+    class AioSqliteError(Exception):
+        pass
 
 load_dotenv()
 DB_PATH = os.getenv('BOT_DB_PATH', 'botdata.sqlite3')
@@ -150,7 +154,7 @@ async def load_active_reminders() -> list:
                         'created_at': datetime.fromisoformat(created_at) if created_at else datetime.now(),
                     }
                     out.append(entry)
-                except Exception as e:
+                except (ValueError, TypeError) as e:
                     logging.exception("Failed to parse reminder row: %s", e)
     return out
 
@@ -163,7 +167,7 @@ async def get_user_delivery_channel(user_id: int):
             if ch is None:
                 try:
                     ch = await bot.fetch_channel(target_id)
-                except Exception:
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     ch = None
             if ch is not None:
                 return ch
@@ -172,7 +176,7 @@ async def get_user_delivery_channel(user_id: int):
         if user:
             dm = user.dm_channel or await user.create_dm()
             return dm
-    except Exception as e:
+    except (discord.HTTPException, discord.Forbidden, discord.NotFound) as e:
         logging.exception("Failed to resolve delivery channel for user %s: %s", user_id, e)
     return None
 
@@ -196,14 +200,16 @@ async def _schedule_once_noctx(entry: dict):
         ch = await get_user_delivery_channel(entry.get('user_id'))
         if ch:
             await ch.send(f"{entry.get('message','')}\n<@{entry.get('user_id')}>")
-    except Exception as e:
+    except asyncio.CancelledError:
+        raise
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
         logging.exception("Error delivering loaded one-time reminder: %s", e)
     finally:
         try:
             if entry in CURRENT_REMINDERS:
                 CURRENT_REMINDERS.remove(entry)
             await cancel_reminder(entry)
-        except Exception:
+        except AioSqliteError:
             pass
 
 async def _schedule_daily_noctx(entry: dict):
@@ -218,7 +224,7 @@ async def _schedule_daily_noctx(entry: dict):
             if ch:
                 try:
                     await ch.send(f"{entry.get('message','')}\n<@{entry.get('user_id')}>")
-                except Exception as e:
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
                     logging.exception("Daily reminder send failed: %s", e)
             # Compute next
             try:
@@ -226,8 +232,11 @@ async def _schedule_daily_noctx(entry: dict):
                     entry['next_run'] = _compute_next_daily_fixed_run(entry['hour'], entry['minute'], entry['tz'])
                 else:
                     entry['next_run'] = datetime.now() + timedelta(days=1)
-                await update_reminder_next_run(entry)
             except Exception:
+                pass
+            try:
+                await update_reminder_next_run(entry)
+            except AioSqliteError:
                 pass
     except Exception as e:
         logging.exception("Daily scheduler error: %s", e)
@@ -244,15 +253,18 @@ async def _schedule_weekly_noctx(entry: dict):
             if ch:
                 try:
                     await ch.send(f"{entry.get('message','')}\n<@{entry.get('user_id')}>")
-                except Exception as e:
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
                     logging.exception("Weekly reminder send failed: %s", e)
             try:
                 if entry.get('fixed_time') and entry.get('tz') is not None:
                     entry['next_run'] = _compute_next_weekly_fixed_run(entry['hour'], entry['minute'], entry['tz'], entry['weekday'])
                 else:
                     entry['next_run'] = datetime.now() + timedelta(days=7)
-                await update_reminder_next_run(entry)
             except Exception:
+                pass
+            try:
+                await update_reminder_next_run(entry)
+            except AioSqliteError:
                 pass
     except Exception as e:
         logging.exception("Weekly scheduler error: %s", e)
@@ -291,8 +303,6 @@ UNIT_SECONDS = {
 MIN_DELAY = 5          # seconds
 MAX_DELAY = 30 * 24 * 3600  # 30 days in seconds
 
-# Preferred channel names to deliver reminders
-REMINDERS_CHANNEL_NAMES = ["🗓️reminders", "reminders"]
 
 # In-memory registry of scheduled reminders (lost on restart)
 # Each entry: {
@@ -334,7 +344,7 @@ async def get_reminders_channel(ctx):
             if ch is None:
                 try:
                     ch = await bot.fetch_channel(target_id)
-                except Exception:
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     ch = None
             if ch is not None:
                 # Check send permissions where applicable (guild channels/threads)
@@ -345,7 +355,7 @@ async def get_reminders_channel(ctx):
                         me = guild.me or ctx.me
                         perms = ch.permissions_for(me)
                         can_send = bool(getattr(perms, 'send_messages', False))
-                except Exception:
+                except AttributeError:
                     pass
                 if can_send:
                     return ch
@@ -413,7 +423,7 @@ async def remindme(ctx, when: str = None, *, message: str = None):
             rid = await insert_reminder(entry)
             if rid and rid > 0:
                 entry['id'] = rid
-        except Exception as e:
+        except AioSqliteError as e:
             logging.exception("Failed to persist one-time fixed reminder: %s", e)
         pretty_when = f"at {hour:02d}:{minute:02d} ({tz_name}) on {due.strftime('%Y-%m-%d')}"
         await ctx.send(f"{ctx.author.mention} I will remind you {pretty_when}: {message}")
@@ -427,7 +437,9 @@ async def remindme(ctx, when: str = None, *, message: str = None):
                     return
                 target_channel = await get_reminders_channel(ctx)
                 await target_channel.send(f"{message}\n{ctx.author.mention}")
-            except Exception as e:
+            except asyncio.CancelledError:
+                raise
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
                 logging.exception("Error delivering reminder: %s", e)
             finally:
                 try:
@@ -458,7 +470,7 @@ async def remindme(ctx, when: str = None, *, message: str = None):
         rid = await insert_reminder(entry)
         if rid and rid > 0:
             entry['id'] = rid
-    except Exception as e:
+    except AioSqliteError as e:
         logging.exception("Failed to persist one-time reminder: %s", e)
 
     confirmation = f"{ctx.author.mention} I will remind you in {result}: {message}"
@@ -473,7 +485,9 @@ async def remindme(ctx, when: str = None, *, message: str = None):
             # If the channel still exists and the bot can send messages, deliver it to the reminders channel.
             target_channel = await get_reminders_channel(ctx)
             await target_channel.send(f"{message}\n{ctx.author.mention}")
-        except Exception as e:
+        except asyncio.CancelledError:
+            raise
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
             # Swallow exceptions to avoid crashing the task; optional: log to file.
             logging.exception("Error delivering reminder: %s", e)
         finally:
@@ -482,7 +496,7 @@ async def remindme(ctx, when: str = None, *, message: str = None):
                 if entry in CURRENT_REMINDERS:
                     CURRENT_REMINDERS.remove(entry)
                 await cancel_reminder(entry)
-            except Exception:
+            except AioSqliteError:
                 pass
 
     # Fire-and-forget task
@@ -571,7 +585,7 @@ async def remindevery(ctx, weekday: str = None, *, message: str = None):
         if not tz_name:
             return await ctx.send("Please set your time zone first with !settimezone <IANA_tz> (e.g., America/New_York).")
         next_run = _compute_next_weekly_fixed_run(fixed_hour, fixed_min, tz_name, target_idx)
-        when_str = f"{datetime.now().strftime('%A')} weekly at {fixed_hour:02d}:{fixed_min:02d} ({tz_name}) starting {next_run.strftime('%Y-%m-%d')}"
+        when_str = f"{next_run.strftime('%A')} weekly at {fixed_hour:02d}:{fixed_min:02d} ({tz_name}) starting {next_run.strftime('%Y-%m-%d')}"
     else:
         now = datetime.now()
         next_run = compute_next_weekday_run(now, target_idx)
@@ -654,7 +668,7 @@ def _compute_next_daily_fixed_run(hour: int, minute: int, tz_name: str) -> datet
     """Compute next occurrence in server-local naive time for a user's tz fixed time."""
     try:
         tz = ZoneInfo(tz_name) if ZoneInfo else None
-    except Exception:
+    except ZoneInfoNotFoundError:
         tz = None
     now_server = datetime.now()
     if not tz:
@@ -676,26 +690,26 @@ def _compute_next_weekly_fixed_run(hour: int, minute: int, tz_name: str, target_
     """Next occurrence of target_weekday at HH:MM in user's tz, returned as server-local naive."""
     try:
         tz = ZoneInfo(tz_name) if ZoneInfo else None
-    except Exception:
+    except ZoneInfoNotFoundError:
         tz = None
     now_server = datetime.now()
     if not tz:
         # Approximate using server local time if tz not available
         now = now_server
+        base = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         days_ahead = (target_weekday - now.weekday()) % 7
-        if days_ahead == 0 and (now.hour, now.minute) >= (hour, minute):
+        if days_ahead == 0 and base <= now:
             days_ahead = 7
-        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=days_ahead)
+        candidate = base + timedelta(days=days_ahead)
         return candidate
     now_user = datetime.now(tz)
-    candidate = now_user.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    base = now_user.replace(hour=hour, minute=minute, second=0, microsecond=0)
     days_ahead = (target_weekday - now_user.weekday()) % 7
-    if days_ahead == 0 and candidate <= now_user:
+    if days_ahead == 0 and base <= now_user:
         days_ahead = 7
-    elif days_ahead > 0:
-        candidate = candidate + timedelta(days=days_ahead)
-        # Rebuild time after adding days to avoid day overflow issues
-        candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    candidate = base + timedelta(days=days_ahead)
+    # Rebuild time after adding days to avoid any overflow issues (safety)
+    candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
     # Convert to server-local naive
     return candidate.astimezone().replace(tzinfo=None)
 
@@ -704,7 +718,7 @@ def _compute_next_one_time_fixed_run(hour: int, minute: int, tz_name: str) -> da
     """Next occurrence today or tomorrow at HH:MM in user's tz, returned as server-local naive."""
     try:
         tz = ZoneInfo(tz_name) if ZoneInfo else None
-    except Exception:
+    except ZoneInfoNotFoundError:
         tz = None
     now_server = datetime.now()
     if not tz:
@@ -719,6 +733,30 @@ def _compute_next_one_time_fixed_run(hour: int, minute: int, tz_name: str) -> da
     return candidate.astimezone().replace(tzinfo=None)
 
 
+def _compute_specific_date_run(year: int, month: int, day: int, hour: int, minute: int, tz_name: str = None) -> datetime:
+    """Compute a server-local naive datetime for a specific calendar date/time in a user's tz (if available).
+    If tz_name is None or invalid, uses server local time. Raises ValueError if the provided date is invalid.
+    """
+    # Validate date by constructing a date first
+    try:
+        _ = datetime(year, month, day)  # will raise if invalid
+    except Exception as e:
+        raise ValueError("Invalid date") from e
+    # Try to use timezone if available
+    tz = None
+    if tz_name and ZoneInfo:
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = None
+    if tz is None:
+        # Server local naive datetime (construct directly instead of replacing 'now')
+        return datetime(year, month, day, hour, minute, 0, 0)
+    # Build in user's tz, then convert to server local naive
+    dt_user = datetime(year, month, day, hour, minute, 0, 0, tzinfo=tz)
+    return dt_user.astimezone().replace(tzinfo=None)
+
+
 @bot.command(name="settimezone", help="Set your time zone: !settimezone <IANA_tz> (e.g., America/New_York)")
 async def settimezone(ctx, tz: str = None):
     if tz is None:
@@ -727,12 +765,12 @@ async def settimezone(ctx, tz: str = None):
         return await ctx.send("Sorry, this bot requires Python 3.9+ with zoneinfo to set time zones.")
     try:
         _ = ZoneInfo(tz)
-    except Exception:
+    except ZoneInfoNotFoundError:
         return await ctx.send("Invalid time zone. Please provide a valid IANA tz (e.g., Europe/London, Asia/Kolkata).")
     USER_TIMEZONES[ctx.author.id] = tz
     try:
         await upsert_user_settings(ctx.author.id, tz=tz)
-    except Exception as e:
+    except AioSqliteError as e:
         logging.exception("Failed to persist timezone: %s", e)
     await ctx.send(f"{ctx.author.mention} Your time zone has been set to {tz}.")
 
@@ -772,7 +810,7 @@ async def setchannel(ctx, *, target: str = None):
                                 if getattr(th, 'name', '').lower() == name:
                                     ch_obj = th
                                     break
-                        except Exception:
+                        except AttributeError:
                             pass
             if ch_obj is None and id_str:
                 try:
@@ -784,7 +822,7 @@ async def setchannel(ctx, *, target: str = None):
                     if ch_obj is None:
                         try:
                             ch_obj = await bot.fetch_channel(cid)
-                        except Exception:
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                             ch_obj = None
         if ch_obj is None:
             return await ctx.send("I couldn't find that channel/thread. Provide a channel mention like #general, a numeric ID, or use !setremindchannel here.")
@@ -796,14 +834,14 @@ async def setchannel(ctx, *, target: str = None):
                 me = guild.me or ctx.me
                 perms = ch_obj.permissions_for(me)
                 can_send = bool(getattr(perms, 'send_messages', False))
-        except Exception:
+        except AttributeError:
             pass
         if not can_send:
             return await ctx.send("I don't have permission to send messages in that channel/thread. Please choose another.")
         USER_REMINDER_CHANNELS[ctx.author.id] = ch_obj.id
         try:
             await upsert_user_settings(ctx.author.id, channel_id=ch_obj.id)
-        except Exception as e:
+        except AioSqliteError as e:
             logging.exception("Failed to persist reminder channel: %s", e)
         # Build friendly destination text
         dest = "that channel"
@@ -871,7 +909,7 @@ async def remindeveryday(ctx, *, message: str = None):
         rid = await insert_reminder(entry)
         if rid and rid > 0:
             entry['id'] = rid
-    except Exception as e:
+    except AioSqliteError as e:
         logging.exception("Failed to persist daily reminder: %s", e)
 
     await ctx.send(f"{ctx.author.mention} I will remind you {when_str}. Message: {actual_message}")
@@ -887,7 +925,7 @@ async def remindeveryday(ctx, *, message: str = None):
                     break
                 try:
                     await target_channel.send(f"{actual_message}\n{ctx.author.mention}")
-                except Exception as e:
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
                     logging.exception("Error delivering daily recurring reminder: %s", e)
                 # Compute next occurrence
                 try:
@@ -960,7 +998,7 @@ async def delete_reminder(ctx, index: int = None):
             pass
         try:
             await cancel_reminder(entry)
-        except Exception as e:
+        except AioSqliteError as e:
             logging.exception("Failed to cancel reminder in DB: %s", e)
         msg = entry.get('message', '')
         typ = entry.get('type', 'once')
@@ -976,37 +1014,94 @@ async def help_command(ctx):
     Display help for all available commands with usage examples and notes.
     """
     prefix = '!'
-    help_text = (
-        "Here are the available commands:\n\n"
-        f"{prefix}remindme <time|HH:MM> <message>\n"
-        "  - Set a one-time reminder after a delay, or at a specific time today/tomorrow in your time zone.\n"
-        "  - Duration supports: s (seconds), m (minutes), h (hours), d (days).\n"
-        "  - Examples: !remindme 30s stretch | !remindme 10m drink water | !remindme 08:15 stand up\n\n"
-        f"{prefix}remindevery <weekday> [HH:MM] <message>\n"
-        "  - Set a weekly recurring reminder on a given weekday (Mon/Tue/Wed/Thu/Fri/Sat/Sun).\n"
-        "  - Examples: !remindevery friday drink water | !remindevery fri 09:00 drink water\n\n"
-        f"{prefix}remindeveryday [HH:MM] <message>\n"
-        "  - Set a daily recurring reminder. Optional HH:MM uses your set time zone.\n"
-        "  - Examples: !remindeveryday drink water | !remindeveryday 08:30 drink water\n\n"
-        f"{prefix}settimezone <IANA_tz>\n"
-        "  - Set your time zone (e.g., America/New_York). Required for specific times.\n\n"
-        f"{prefix}setremindchannel [here|#channel|channel_id|thread_id]\n"
-        "  - Set the channel or thread where your reminders will be sent. Defaults to the current channel/thread.\n\n"
-        f"{prefix}reminders\n"
-        "  - List your current reminders and their next run time.\n\n"
-        f"{prefix}deletereminder <number>\n"
-        "  - Delete one of your reminders by its number as shown in !reminders.\n\n"
-        f"{prefix}editreminder <number> <new message>\n"
-        "  - Edit one of your reminders by its number as shown in !reminders.\n\n"
-        "Notes:\n"
-        "- By default, reminders are sent to the channel or thread where you set them up.\n"
-        "- You can change the destination with !setremindchannel [here|#channel|channel_id|thread_id].\n"
-        "- Reminders are saved to a database and survive bot restarts.\n"
-        "- Times are approximate; across DST changes there may be slight shifts.\n"
-        "- Reminder messages are delivered as your custom text with your mention on a new line.\n"
-        "- Fixed-time reminders use your time zone; set it via !settimezone."
-    )
-    await ctx.send(help_text)
+    try:
+        embed = discord.Embed(
+            title="Reminder Bot Help",
+            description="Friendly commands to help you remember things. Use the buttons below... just kidding — use the commands below!",
+            color=discord.Color.blurple()
+        )
+        embed.add_field(
+            name="One‑time reminders",
+            value=(
+                f"• `{prefix}remindme <time|HH:MM> <message>`\n"
+                "  Set a one‑time reminder after a delay, or at a specific time today/tomorrow.\n"
+                "  Supports `s`/`m`/`h`/`d` (e.g., `30s`, `10m`, `2h`, `1d`).\n"
+                "  Examples: `!remindme 30s stretch`, `!remindme 10m drink water`, `!remindme 08:15 stand up`\n\n"
+                f"• `{prefix}remindon <YYYY-MM-DD> [HH:MM] <message>`\n"
+                "  Set a one‑time reminder for a specific calendar date (optionally a time).\n"
+                "  Examples: `!remindon 2025-12-31 Celebrate!`, `!remindon 2025-12-31 09:00 Wish happy new year`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Recurring reminders",
+            value=(
+                f"• `{prefix}remindevery <weekday> [HH:MM] <message>`\n"
+                "  Weekly reminder on the given weekday (Mon/Tue/Wed/Thu/Fri/Sat/Sun).\n"
+                "  Examples: `!remindevery friday drink water`, `!remindevery fri 09:00 drink water`\n\n"
+                f"• `{prefix}remindeveryday [HH:MM] <message>`\n"
+                "  Daily reminder. If you specify `HH:MM`, your time zone is used."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Managing reminders",
+            value=(
+                f"• `{prefix}reminders` — List your reminders\n"
+                f"• `{prefix}deletereminder <number>` — Delete a reminder by its list number\n"
+                f"• `{prefix}editreminder <number> <new message>` — Edit a reminder's message"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Settings",
+            value=(
+                f"• `{prefix}settimezone <IANA_tz>` — Set your time zone (e.g., `America/New_York`)\n"
+                f"• `{prefix}setremindchannel [here|#channel|channel_id|thread_id]` — Choose where reminders are sent"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text=(
+            "Notes: Reminders are saved and survive restarts. Fixed-time reminders use your time zone (set with !settimezone). "
+            "Across DST changes, times may shift slightly. Messages are delivered with your mention on a new line."
+        ))
+        await ctx.send(embed=embed)
+    except Exception:
+        # Fallback to plain text if embeds fail for any reason
+        help_text = (
+            "Here are the available commands:\n\n"
+            f"{prefix}remindme <time|HH:MM> <message>\n"
+            "  - Set a one-time reminder after a delay, or at a specific time today/tomorrow in your time zone.\n"
+            "  - Duration supports: s (seconds), m (minutes), h (hours), d (days).\n"
+            "  - Examples: !remindme 30s stretch | !remindme 10m drink water | !remindme 08:15 stand up\n\n"
+            f"{prefix}remindon <YYYY-MM-DD> [HH:MM] <message>\n"
+            "  - Set a one-time reminder for a specific calendar date (optionally time). Uses your time zone if set.\n"
+            "  - Examples: !remindon 2025-12-31 Celebrate! | !remindon 2025-12-31 09:00 Wish happy new year\n\n"
+            f"{prefix}remindevery <weekday> [HH:MM] <message>\n"
+            "  - Set a weekly recurring reminder on a given weekday (Mon/Tue/Wed/Thu/Fri/Sat/Sun).\n"
+            "  - Examples: !remindevery friday drink water | !remindevery fri 09:00 drink water\n\n"
+            f"{prefix}remindeveryday [HH:MM] <message>\n"
+            "  - Set a daily recurring reminder. Optional HH:MM uses your set time zone.\n"
+            "  - Examples: !remindeveryday drink water | !remindeveryday 08:30 drink water\n\n"
+            f"{prefix}settimezone <IANA_tz>\n"
+            "  - Set your time zone (e.g., America/New_York). Required for specific times.\n\n"
+            f"{prefix}setremindchannel [here|#channel|channel_id|thread_id]\n"
+            "  - Set the channel or thread where your reminders will be sent. Defaults to the current channel/thread.\n\n"
+            f"{prefix}reminders\n"
+            "  - List your current reminders and their next run time.\n\n"
+            f"{prefix}deletereminder <number>\n"
+            "  - Delete one of your reminders by its number as shown in !reminders.\n\n"
+            f"{prefix}editreminder <number> <new message>\n"
+            "  - Edit one of your reminders by its number as shown in !reminders.\n\n"
+            "Notes:\n"
+            "- By default, reminders are sent to the channel or thread where you set them up.\n"
+            "- You can change the destination with !setremindchannel [here|#channel|channel_id|thread_id].\n"
+            "- Reminders are saved to a database and survive bot restarts.\n"
+            "- Times are approximate; across DST changes there may be slight shifts.\n"
+            "- Reminder messages are delivered as your custom text with your mention on a new line.\n"
+            "- Fixed-time reminders use your time zone; set it via !settimezone."
+        )
+        await ctx.send(help_text)
 
 @bot.command(name="editreminder", aliases=["editrem", "edit"], help="Edit one of your reminders by its number from !reminders: !editreminder <number> <new message>")
 async def edit_reminder(ctx, index: int = None, *, new_message: str = None):
@@ -1076,5 +1171,102 @@ async def edit_reminder(ctx, index: int = None, *, new_message: str = None):
     except Exception as ex:
         logging.exception("Failed to edit reminder: %s", ex)
         await ctx.send("Sorry, I couldn't edit that reminder right now.")
+
+
+@bot.command(name="remindon", help="Set a one-time reminder for a specific date: !remindon <YYYY-MM-DD> [HH:MM] <message>")
+async def remind_on(ctx, *, args: str = None):
+    """Schedule a one-time reminder for a specific calendar date, optionally with a time.
+    Usage:
+    - !remindon 2025-12-31 Celebrate!
+    - !remindon 2025-12-31 09:00 Wish happy new year
+    Also accepts DD/MM/YYYY.
+    Default time when omitted: 09:00.
+    """
+    try:
+        if args is None or not args.strip():
+            return await ctx.send("Usage: !remindon <YYYY-MM-DD> [HH:MM] <message>")
+        text = args.strip()
+        # Parse date at the beginning
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})\s+(.*)$", text)
+        day_first = False
+        if not m:
+            m2 = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})\s+(.*)$", text)
+            if m2:
+                day_first = True
+                m = m2
+        if not m:
+            return await ctx.send("Please provide the date as YYYY-MM-DD (e.g., 2025-12-31) or DD/MM/YYYY.")
+        if day_first:
+            d = int(m.group(1)); mo = int(m.group(2)); y = int(m.group(3)); rest = m.group(4)
+        else:
+            y = int(m.group(1)); mo = int(m.group(2)); d = int(m.group(3)); rest = m.group(4)
+        # Parse optional HH:MM at the start of the remainder
+        hour, minute = 9, 0
+        mtime = re.match(r"^(\d{1,2}:\d{2})\s+(.*)$", rest)
+        actual_message = rest
+        if mtime:
+            parsed = _parse_hhmm(mtime.group(1))
+            if not parsed:
+                return await ctx.send("Invalid time format. Use 24h HH:MM, e.g., 07:45 or 19:05.")
+            hour, minute = parsed
+            actual_message = mtime.group(2)
+        if not actual_message or not actual_message.strip():
+            return await ctx.send("Please include a message after the date/time.")
+        # Compute the target datetime in server local
+        tz_name = USER_TIMEZONES.get(ctx.author.id)
+        try:
+            due = _compute_specific_date_run(y, mo, d, hour, minute, tz_name)
+        except ValueError:
+            return await ctx.send("That date doesn't look valid. Please check the day/month/year.")
+        # Validate future
+        if due <= datetime.now():
+            return await ctx.send("That date/time is in the past. Please provide a future date/time.")
+        # Register entry
+        entry = {
+            'user_id': ctx.author.id,
+            'type': 'once',
+            'message': actual_message.strip(),
+            'next_run': due,
+            'created_at': datetime.now(),
+            'tz': tz_name,
+            'fixed_time': True,
+            'hour': hour,
+            'minute': minute,
+        }
+        CURRENT_REMINDERS.append(entry)
+        try:
+            rid = await insert_reminder(entry)
+            if rid and rid > 0:
+                entry['id'] = rid
+        except Exception as e:
+            logging.exception("Failed to persist date reminder: %s", e)
+        # Confirmation text
+        tz_note = f" ({tz_name})" if tz_name else ""
+        await ctx.send(f"{ctx.author.mention} I will remind you on {y:04d}-{mo:02d}-{d:02d} at {hour:02d}:{minute:02d}{tz_note}: {actual_message.strip()}")
+
+        async def deliver():
+            try:
+                delay = max(0, (due - datetime.now()).total_seconds())
+                await asyncio.sleep(delay)
+                if entry.get('cancelled') or entry not in CURRENT_REMINDERS:
+                    return
+                target_channel = await get_reminders_channel(ctx)
+                await target_channel.send(f"{actual_message.strip()}\n{ctx.author.mention}")
+            except Exception as e:
+                logging.exception("Error delivering date reminder: %s", e)
+            finally:
+                try:
+                    if entry in CURRENT_REMINDERS:
+                        CURRENT_REMINDERS.remove(entry)
+                    await cancel_reminder(entry)
+                except Exception:
+                    pass
+        asyncio.create_task(deliver())
+    except Exception as ex:
+        logging.exception("Failed to set date reminder: %s", ex)
+        await ctx.send("Sorry, I couldn't set that reminder right now.")
+
+if not TOKEN:
+    raise SystemExit("DISCORD_TOKEN is not set. Please configure it in your environment or .env file as DISCORD_TOKEN.")
 
 bot.run(TOKEN, log_handler=handler, log_level=logging.DEBUG)
