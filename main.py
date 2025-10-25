@@ -1098,6 +1098,85 @@ async def delete_reminder(ctx, index: int = None):
         await ctx.send("Sorry, I couldn't delete that reminder right now.")
 
 
+@bot.command(name="settings", aliases=["mysettings", "config"], help="Show your current settings: time zone, delivery channel, and prefix")
+async def settings_command(ctx):
+    """Display the user's current configuration: time zone, delivery channel/thread, and the active prefix."""
+    try:
+        user_id = getattr(getattr(ctx, 'author', None), 'id', None)
+        prefix_eff = getattr(ctx, 'prefix', DEFAULT_PREFIX)
+        # Time zone
+        tz_name = USER_TIMEZONES.get(user_id)
+        tz_display = tz_name or "Not set"
+        # Configured delivery channel
+        ch_id = USER_REMINDER_CHANNELS.get(user_id)
+        ch_obj = None
+        ch_configured_display = "Not set (defaults to this channel/thread or DMs)"
+        if ch_id:
+            try:
+                ch_obj = bot.get_channel(ch_id)
+                if ch_obj is None:
+                    try:
+                        ch_obj = await bot.fetch_channel(ch_id)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        ch_obj = None
+            except Exception:
+                ch_obj = None
+            if ch_obj is not None:
+                try:
+                    if isinstance(ch_obj, discord.Thread):
+                        ch_configured_display = f"Thread: {ch_obj.name} (<#{ch_obj.id}>)"
+                    elif hasattr(ch_obj, 'name'):
+                        ch_configured_display = f"Channel: #{ch_obj.name} (<#{ch_obj.id}>)"
+                    else:
+                        ch_configured_display = f"<#{ch_obj.id}>"
+                except Exception:
+                    ch_configured_display = f"<#{getattr(ch_obj, 'id', ch_id)}>"
+            else:
+                ch_configured_display = f"Unknown or inaccessible (<#{ch_id}>)"
+        # Effective destination for this conversation (best effort)
+        try:
+            resolved = await get_reminders_channel(ctx)
+            if resolved is not None:
+                if isinstance(resolved, discord.Thread):
+                    resolved_display = f"Thread: {resolved.name} (<#{resolved.id}>)"
+                elif hasattr(resolved, 'name'):
+                    resolved_display = f"Channel: #{resolved.name} (<#{resolved.id}>)"
+                else:
+                    resolved_display = "Direct Message"
+            else:
+                resolved_display = "Unknown"
+        except Exception:
+            resolved_display = "Unknown"
+        # Prefix information
+        if ctx.guild is not None:
+            server_prefix = GUILD_PREFIXES.get(ctx.guild.id, DEFAULT_PREFIX)
+            prefix_text = f"Effective: `{prefix_eff}`\nServer prefix: `{server_prefix}`"
+        else:
+            prefix_text = f"Effective (DMs): `{prefix_eff}`"
+        # Build embed
+        try:
+            embed = discord.Embed(title="Your Settings", color=discord.Color(0x3B8D6F))
+            embed.add_field(name="Time zone", value=tz_display, inline=False)
+            embed.add_field(name="Configured delivery", value=ch_configured_display, inline=False)
+            embed.add_field(name="Where this convo will deliver", value=resolved_display, inline=False)
+            embed.add_field(name="Prefix", value=prefix_text, inline=False)
+            embed.set_footer(text="Change with: settimezone, setremindchannel, setprefix")
+            return await ctx.send(embed=embed)
+        except Exception:
+            pass
+        # Plain text fallback
+        lines = [
+            "Your current settings:",
+            f"- Time zone: {tz_display}",
+            f"- Configured delivery: {ch_configured_display}",
+            f"- Where this convo will deliver: {resolved_display}",
+            f"- Prefix: {prefix_text}",
+        ]
+        await ctx.send("\n".join(lines))
+    except Exception as e:
+        logging.exception("Failed to show settings: %s", e)
+        await ctx.send("Sorry, I couldn't retrieve your settings right now.")
+
 @bot.command(name="help", help="Show information about all commands")
 async def help_command(ctx):
     """
@@ -1148,7 +1227,8 @@ async def help_command(ctx):
             value=(
                 f"• `{prefix}settimezone <IANA_tz>` — Set your time zone (e.g., `America/New_York`)\n"
                 f"• `{prefix}setremindchannel [here|#channel|channel_id|thread_id]` — Choose where reminders are sent\n"
-                f"• `{prefix}setprefix <new_prefix>` — Change the bot's command prefix for this server"
+                f"• `{prefix}setprefix <new_prefix>` — Change the bot's command prefix for this server\n"
+                f"• `{prefix}settings` — Show your current settings (time zone, delivery channel, and current prefix)"
             ),
             inline=False,
         )
@@ -1180,6 +1260,8 @@ async def help_command(ctx):
             "  - Set the channel or thread where your reminders will be sent. Defaults to the current channel/thread.\n\n"
             f"{prefix}setprefix <new_prefix>\n"
             "  - Change the bot's command prefix for this server.\n\n"
+            f"{prefix}settings\n"
+            "  - Show your current settings (time zone, delivery channel, and current prefix).\n\n"
             f"{prefix}reminders\n"
             "  - List your current reminders and their next run time.\n\n"
             f"{prefix}deletereminder <number>\n"
