@@ -218,6 +218,38 @@ async def cancel_reminder(entry: dict):
         await db.execute("UPDATE reminders SET cancelled = 1 WHERE id = ?", (rid,))
         await db.commit()
 
+# --- Robust datetime parsing for DB values ---
+def _parse_db_datetime(value: str):
+    """Parse ISO datetime strings from DB, tolerating 'Z' and offsets.
+    Returns naive server-local datetime or None on failure.
+    """
+    if not value:
+        return None
+    try:
+        s = str(value).strip()
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
+        # Some SQLite drivers may store with a space separator
+        if 'T' not in s and ' ' in s:
+            s_try = s.replace(' ', 'T')
+        else:
+            s_try = s
+        dt = datetime.fromisoformat(s_try)
+        if getattr(dt, 'tzinfo', None) is not None:
+            # Convert to server local naive
+            return dt.astimezone().replace(tzinfo=None)
+        return dt
+    except Exception:
+        try:
+            # Last resort: try without replacing space
+            dt = datetime.fromisoformat(str(value))
+            if getattr(dt, 'tzinfo', None) is not None:
+                return dt.astimezone().replace(tzinfo=None)
+            return dt
+        except Exception:
+            logging.warning("Unrecognized datetime in DB: %r", value)
+            return None
+
 async def load_active_reminders() -> list:
     if not aiosqlite:
         return []
@@ -226,6 +258,8 @@ async def load_active_reminders() -> list:
         async with db.execute("SELECT id, user_id, type, message, tz, fixed_time, hour, minute, weekday, next_run, created_at, paused, tags FROM reminders WHERE cancelled = 0") as cur:
             async for rid, user_id, rtype, message, tz, fixed_time, hour, minute, weekday, next_run, created_at, paused, tags in cur:
                 try:
+                    next_dt = _parse_db_datetime(next_run) if next_run else None
+                    created_dt = _parse_db_datetime(created_at) if created_at else None
                     entry = {
                         'id': rid,
                         'user_id': user_id,
@@ -236,13 +270,13 @@ async def load_active_reminders() -> list:
                         'hour': hour,
                         'minute': minute,
                         'weekday': weekday,
-                        'next_run': datetime.fromisoformat(next_run) if next_run else None,
-                        'created_at': datetime.fromisoformat(created_at) if created_at else datetime.now(),
+                        'next_run': next_dt,
+                        'created_at': created_dt or datetime.now(),
                         'paused': bool(paused),
                         'tags': tags,
                     }
                     out.append(entry)
-                except (ValueError, TypeError) as e:
+                except Exception as e:
                     logging.exception("Failed to parse reminder row: %s", e)
     return out
 
