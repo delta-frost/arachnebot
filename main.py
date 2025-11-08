@@ -290,7 +290,7 @@ async def _schedule_once_noctx(entry: dict):
             return
         await asyncio.sleep(random.uniform(0, 2))
         ch = await get_user_delivery_channel(entry.get('user_id'))
-        if ch:
+        if ch and _should_deliver(entry):
             await ch.send(f"{entry.get('message','')}\n<@{entry.get('user_id')}>")
     except asyncio.CancelledError:
         raise
@@ -319,7 +319,7 @@ async def _schedule_daily_noctx(entry: dict):
                 break
             await asyncio.sleep(random.uniform(0, 2))
             ch = await get_user_delivery_channel(entry.get('user_id'))
-            if ch:
+            if ch and _should_deliver(entry):
                 try:
                     await ch.send(f"{entry.get('message','')}\n<@{entry.get('user_id')}>")
                 except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
@@ -356,7 +356,7 @@ async def _schedule_weekly_noctx(entry: dict):
                 break
             await asyncio.sleep(random.uniform(0, 2))
             ch = await get_user_delivery_channel(entry.get('user_id'))
-            if ch:
+            if ch and _should_deliver(entry):
                 try:
                     await ch.send(f"{entry.get('message','')}\n<@{entry.get('user_id')}>")
                 except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
@@ -427,6 +427,39 @@ MAX_DELAY = 30 * 24 * 3600  # 30 days in seconds
 #   'weekday': int | None,      # for weekly (0=Mon..6=Sun)
 # }
 CURRENT_REMINDERS = []
+
+# De-duplication guard: prevent duplicate sends within a short time window (e.g., around DST shifts)
+DEDUP_WINDOW_SECONDS = 600  # 10 minutes
+_LAST_FIRED = {}  # key -> datetime of last successful delivery
+
+def _reminder_key(entry: dict):
+    rid = entry.get('id')
+    if rid:
+        return ('id', rid)
+    # Fallback composite key for in-memory, not-yet-persisted entries
+    return (
+        'anon',
+        entry.get('user_id'),
+        entry.get('type'),
+        entry.get('message'),
+        entry.get('hour'),
+        entry.get('minute'),
+        entry.get('weekday'),
+    )
+
+
+def _should_deliver(entry: dict) -> bool:
+    try:
+        key = _reminder_key(entry)
+        now = datetime.now()
+        last = _LAST_FIRED.get(key)
+        if last and (now - last).total_seconds() < DEDUP_WINDOW_SECONDS:
+            return False
+        _LAST_FIRED[key] = now
+        return True
+    except Exception:
+        # On any unexpected error, default to delivering once
+        return True
 
 # In-memory user timezone settings (lost on restart)
 # Maps user_id -> IANA timezone string (e.g., "America/New_York")
@@ -654,7 +687,8 @@ async def remindme(ctx, when: str = None, *, message: str = None):
                     return
                 await asyncio.sleep(random.uniform(0, 2))
                 target_channel = await get_reminders_channel(ctx)
-                await target_channel.send(f"{message}\n{ctx.author.mention}")
+                if _should_deliver(entry):
+                    await target_channel.send(f"{message}\n{ctx.author.mention}")
             except asyncio.CancelledError:
                 raise
             except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
@@ -713,7 +747,8 @@ async def remindme(ctx, when: str = None, *, message: str = None):
             # If the channel still exists and the bot can send messages, deliver it to the reminders channel.
             await asyncio.sleep(random.uniform(0, 2))
             target_channel = await get_reminders_channel(ctx)
-            await target_channel.send(f"{message}\n{ctx.author.mention}")
+            if _should_deliver(entry):
+                await target_channel.send(f"{message}\n{ctx.author.mention}")
         except asyncio.CancelledError:
             raise
         except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
@@ -871,7 +906,8 @@ async def remindevery(ctx, weekday: str = None, *, message: str = None):
                     break
                 try:
                     await asyncio.sleep(random.uniform(0, 2))
-                    await target_channel.send(f"{actual_message}\n{ctx.author.mention}")
+                    if _should_deliver(entry):
+                        await target_channel.send(f"{actual_message}\n{ctx.author.mention}")
                 except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
                     logging.exception("Error delivering recurring reminder: %s", e)
                 # Update next occurrence and then sleep until next_run
@@ -1221,7 +1257,8 @@ async def remindeveryday(ctx, *, message: str = None):
                     break
                 try:
                     await asyncio.sleep(random.uniform(0, 2))
-                    await target_channel.send(f"{actual_message}\n{ctx.author.mention}")
+                    if _should_deliver(entry):
+                        await target_channel.send(f"{actual_message}\n{ctx.author.mention}")
                 except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
                     logging.exception("Error delivering daily recurring reminder: %s", e)
                 # Compute next occurrence
@@ -1687,7 +1724,8 @@ async def remind_on(ctx, *, args: str = None):
                     return
                 await asyncio.sleep(random.uniform(0, 2))
                 target_channel = await get_reminders_channel(ctx)
-                await target_channel.send(f"{actual_message.strip()}\n{ctx.author.mention}")
+                if _should_deliver(entry):
+                    await target_channel.send(f"{actual_message.strip()}\n{ctx.author.mention}")
             except asyncio.CancelledError:
                 raise
             except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
